@@ -141,8 +141,10 @@ def _members(archive):
     for entry in entries:
         if entry.is_dir() or entry.filename.startswith("__MACOSX/"):
             continue
-        parts = PurePosixPath(entry.filename).parts
-        unsafe = not parts or ".." in parts or entry.filename.startswith("/") or set("\\:\0") & set(entry.filename)
+        # zipfile tidies entry.filename (and differently on Windows), so judge the original
+        name = entry.orig_filename
+        parts = PurePosixPath(name).parts
+        unsafe = not parts or ".." in parts or name.startswith("/") or set("\\:\0") & set(name)
         special = stat.S_IFMT(entry.external_attr >> 16) not in (0, stat.S_IFREG)
         if unsafe or special or entry.flag_bits & 1 or parts in members:
             return None

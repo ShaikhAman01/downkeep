@@ -257,7 +257,7 @@ class ExtractedTest(FolderTest):
             self.assertIsNone(evidence._members(self.record(path)))
 
     def test_unsafe_names_are_refused(self):
-        for name in ["../top/readme.txt", "/top/readme.txt", "top\\readme.txt", "C:readme.txt", "a/../b.txt"]:
+        for name in ["../top/readme.txt", "/top/readme.txt", "top\\readme.txt", "..\\b.txt", "C:readme.txt", "a/../b.txt", "b.txt\0.exe"]:
             with self.subTest(name=name):
                 path = self.zip(files={name: b"hello"}, edit=lambda info, name=name: setattr(info, "filename", name))
                 self.extract(files={"top/readme.txt": b"hello", "b.txt": b"hello"})
@@ -265,6 +265,16 @@ class ExtractedTest(FolderTest):
 
     def record(self, path):
         return next(file for file in scan(self.folder).files if file.name == path.name)
+
+    def test_tidied_names_are_judged_by_the_original(self):
+        path = self.zip(files={"top/readme.txt": b"hello"})
+        with zipfile.ZipFile(path) as archive:
+            (entry,) = archive.infolist()
+        for original in ["top\\readme.txt", "top/readme.txt\0.exe"]:
+            with self.subTest(original=original):
+                entry.orig_filename = original
+                with mock.patch("zipfile.ZipFile.infolist", return_value=[entry]):
+                    self.assertIsNone(evidence._members(self.record(path)))
 
     def test_links_inside_a_zip_are_refused(self):
         path = self.zip(files={"a": b"b"}, edit=lambda info: setattr(info, "external_attr", (stat.S_IFLNK | 0o777) << 16))
