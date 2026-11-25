@@ -5,6 +5,7 @@ import os
 import re
 import socket
 import threading
+import time
 import unittest
 import zipfile
 from importlib.resources import files
@@ -30,6 +31,9 @@ class ServerTest(FolderTest):
         self.shown = []
         self.clock = Clock()
         patch = mock.patch("downkeep.server.find_hosts", return_value={})
+        patch.start()
+        self.addCleanup(patch.stop)
+        patch = mock.patch("downkeep.server.BEAT_SECONDS", 0.02)
         patch.start()
         self.addCleanup(patch.stop)
         self.app = App(str(self.folder), self.shown.append, self.clock)
@@ -137,7 +141,7 @@ class ServerTest(FolderTest):
     def test_nothing_works_without_the_key(self):
         self.assertEqual(self.call("/api/report", "")[0], 403)
         key = self.key()
-        for path in ["/api/report", "/api/show", "/api/here", "/api/leave", "/api/unknown"]:
+        for path in ["/api/report", "/api/show", "/api/stay", "/api/unknown"]:
             for wrong in ["", "x", self.app.code, key[:-1]]:
                 with self.subTest(path=path, wrong=wrong):
                     self.assertEqual(self.call(path, wrong)[0], 403)
@@ -148,14 +152,14 @@ class ServerTest(FolderTest):
         key = self.key()
         for raw in [b"", b"junk", b"[]", b"null", b"[" * 10_000, b"\xff"]:
             with self.subTest(raw=raw[:10]):
-                self.assertEqual(self.ask("POST", "/api/here", raw=raw, headers={"X-Downkeep-Key": key})[0], 400)
+                self.assertEqual(self.ask("POST", "/api/show", raw=raw, headers={"X-Downkeep-Key": key})[0], 400)
         for kind in ["text/plain", "application/x-www-form-urlencoded", "multipart/form-data"]:
             with self.subTest(kind=kind):
-                self.assertEqual(self.call("/api/here", key, **{"Content-Type": kind})[0], 400)
-        self.assertEqual(self.call("/api/here", key, **{"Content-Length": "99999999"})[0], 413)
+                self.assertEqual(self.call("/api/show", key, **{"Content-Type": kind})[0], 400)
+        self.assertEqual(self.call("/api/show", key, **{"Content-Length": "99999999"})[0], 413)
         for length in ["-1", "+5", "1_0", "x"]:
             with self.subTest(length=length):
-                self.assertEqual(self.call("/api/here", key, **{"Content-Length": length})[0], 400)
+                self.assertEqual(self.call("/api/show", key, **{"Content-Length": length})[0], 400)
 
     def test_report(self):
         status, content, _ = self.call("/api/report", self.key())
@@ -218,55 +222,97 @@ class ServerTest(FolderTest):
         self.clock.now += server.CODE_SECONDS + 1
         self.assertTrue(self.app.finished())
 
+    def stay(self, key):
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.request("POST", "/api/stay", b"{}", {"Content-Type": "application/json", "X-Downkeep-Key": key})
+        page = connection.getresponse()
+        self.addCleanup(page.close)
+        self.assertEqual((page.status, page.read(2)), (200, b".."))
+        return page
+
+    def wait_for_pages(self, count):
+        end = time.monotonic() + 5
+        while self.app.pages != count and time.monotonic() < end:
+            time.sleep(0.01)
+        self.assertEqual(self.app.pages, count)
+
+    def test_open_page_keeps_it_running_however_long(self):
+        self.stay(self.key())
+        self.clock.now += 1_000_000
+        self.assertFalse(self.app.finished())
+
     def test_stops_soon_after_the_page_closes(self):
-        key = self.key()
-        self.call("/api/leave", key)
+        self.stay(self.key()).close()
+        self.wait_for_pages(0)
         self.assertFalse(self.app.finished())
         self.clock.now += server.CLOSE_SECONDS + 1
         self.assertTrue(self.app.finished())
 
+    def test_closing_counts_from_when_the_page_left(self):
+        page = self.stay(self.key())
+        self.clock.now += 1_000
+        page.close()
+        self.wait_for_pages(0)
+        self.assertFalse(self.app.finished())
+
     def test_reloading_the_page_keeps_it_running(self):
         key = self.key()
-        self.call("/api/leave", key)
-        self.call("/api/here", key)
+        self.stay(key).close()
+        self.wait_for_pages(0)
+        self.stay(key)
         self.clock.now += server.CLOSE_SECONDS + 1
         self.assertFalse(self.app.finished())
 
     def test_closing_one_of_two_tabs_keeps_it_running(self):
         key = self.key()
-        for page in ["one", "two"]:
-            self.call("/api/here", key, {"page": page})
-        self.call("/api/leave", key, {"page": "one"})
+        pages = [self.stay(key), self.stay(key)]
+        pages[0].close()
+        self.wait_for_pages(1)
         self.clock.now += server.CLOSE_SECONDS + 1
         self.assertFalse(self.app.finished())
-        self.call("/api/leave", key, {"page": "two"})
+        pages[1].close()
+        self.wait_for_pages(0)
         self.clock.now += server.CLOSE_SECONDS + 1
         self.assertTrue(self.app.finished())
 
-    def test_odd_page_names_are_ignored(self):
-        key = self.key()
-        for page in [None, 5, [], {}, "x" * 65]:
-            for path in ["/api/leave", "/api/here"]:
-                self.assertEqual(self.call(path, key, {"page": page})[0], 200)
-            self.assertEqual(self.app.pages, set())
-        for number in range(server.MAX_PAGES + 5):
-            self.call("/api/here", key, {"page": str(number)})
-        self.assertEqual(len(self.app.pages), server.MAX_PAGES)
-
-    def test_stops_when_the_page_goes_quiet_but_not_during_a_scan(self):
+    def test_stops_if_the_page_never_stays(self):
         self.key()
-        self.clock.now += server.IDLE_SECONDS + 1
+        self.assertFalse(self.app.finished())
+        self.clock.now += server.CLOSE_SECONDS + 1
         self.assertTrue(self.app.finished())
+
+    def test_a_slow_browser_gets_the_full_grace(self):
+        self.clock.now += server.CODE_SECONDS - 1
+        self.key()
+        self.assertFalse(self.app.finished())
+
+    def test_never_stops_during_a_scan(self):
+        self.key()
+        self.clock.now += server.CLOSE_SECONDS + 1
         self.app.working = 1
         self.assertFalse(self.app.finished())
+
+    def test_staying_is_locked_down_too(self):
+        page = self.stay(self.key())
+        self.assertEqual(page.headers["Cache-Control"], "no-store")
+        self.assertIn("default-src 'none'", page.headers["Content-Security-Policy"])
+        self.assertIsNone(page.headers["Access-Control-Allow-Origin"])
+        self.assertEqual(self.ask("POST", "/api/stay", {}, {"X-Downkeep-Key": self.app.key, "Origin": "https://evil.example"})[0], 403)
+        self.assertEqual(self.app.pages, 1)
 
     def test_stops_after_a_scan_even_a_failed_one(self):
         key = self.key()
         self.call("/api/report", key)
         self.app.folder = str(self.folder / "gone")
         self.call("/api/report", key)
-        self.clock.now += server.IDLE_SECONDS + 1
+        self.clock.now += server.CLOSE_SECONDS + 1
         self.assertTrue(self.app.finished())
+
+    def test_grace_starts_again_after_a_long_scan(self):
+        key = self.key()
+        self.clock.now += server.CLOSE_SECONDS + 1
+        self.call("/api/report", key)
+        self.assertFalse(self.app.finished())
 
     def test_a_silent_connection_does_not_block_others(self):
         with socket.create_connection(("127.0.0.1", self.port), timeout=5):

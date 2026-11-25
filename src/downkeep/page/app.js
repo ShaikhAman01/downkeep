@@ -5,7 +5,6 @@ const sum = document.querySelector("#sum");
 const again = document.querySelector("#again");
 const status = document.querySelector("#status");
 const sample = document.documentElement.dataset.sample;
-const page = crypto.randomUUID();
 const SHOWN = 500;
 const KINDS = {
   zip: "zip tar gz tar.gz tgz 7z rar xz bz2 zst",
@@ -356,6 +355,16 @@ function expired() {
   message("This link has expired", "Open Downkeep again to get a fresh window. Each link works once, so nobody else can use it.");
 }
 
+async function stay() {
+  try {
+    const answer = await fetch("/api/stay", { method: "POST", headers: { "Content-Type": "application/json", "X-Downkeep-Key": key }, body: "{}" });
+    if (!answer.ok) return expired();
+    const reader = answer.body.getReader();
+    while (!(await reader.read()).done);
+  } catch {}
+  closed();
+}
+
 async function start() {
   if (sample) return check();
   const code = decodeURIComponent(location.hash.slice(1));
@@ -365,18 +374,11 @@ async function start() {
     if (code) key = (await ask("/api/session", { code })).key;
     if (!key) return expired();
     sessionStorage.setItem("key", key);
-    await ask("/api/here", { page });
   } catch (error) {
     return error.status ? expired() : closed();
   }
-  setInterval(() => ask("/api/here", { page }).catch((error) => { if (!error.status) closed(); }), 20_000);
-  addEventListener("pagehide", () => {
-    fetch("/api/leave", {
-      method: "POST", keepalive: true, body: JSON.stringify({ page }),
-      headers: { "Content-Type": "application/json", "X-Downkeep-Key": key },
-    });
-  });
-  addEventListener("pageshow", (event) => { if (event.persisted) ask("/api/here", { page }).catch(closed); });
+  addEventListener("pageshow", (event) => { if (event.persisted) location.reload(); });
+  stay();
   await check();
 }
 

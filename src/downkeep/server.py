@@ -16,9 +16,8 @@ from downkeep.scan import ScanError, scan
 HOST = "127.0.0.1"
 MAX_BODY = 16_384
 CODE_SECONDS = 120
-IDLE_SECONDS = 150
 CLOSE_SECONDS = 4
-MAX_PAGES = 50
+BEAT_SECONDS = 1
 
 PAGES = {
     "/": ("index.html", "text/html; charset=utf-8"),
@@ -49,9 +48,8 @@ class App:
         self.code = secrets.token_urlsafe(32)
         self.key: str | None = None
         self.paths: dict[str, str] = {}
-        self.pages: set[str] = set()
+        self.pages = 0
         self.started = self.seen = clock()
-        self.closing: float | None = None
         self.working = 0
         self.lock = threading.Lock()
         self.scanning = threading.Lock()
@@ -62,29 +60,21 @@ class App:
             if self.key or not fresh or not isinstance(code, str) or not _equal(code, self.code):
                 return None
             self.key = secrets.token_urlsafe(32)
-            self._touch()
+            self.seen = self.clock()
             return self.key
 
     def allows(self, key: str | None) -> bool:
         with self.lock:
             return bool(self.key and key and _equal(key, self.key))
 
-    def touch(self) -> None:
+    def arrive(self) -> None:
         with self.lock:
-            self._touch()
+            self.pages += 1
 
-    def arrive(self, page: object) -> None:
+    def leave(self) -> None:
         with self.lock:
-            self._touch()
-            if isinstance(page, str) and len(page) <= 64 and len(self.pages) < MAX_PAGES:
-                self.pages.add(page)
-
-    def leave(self, page: object) -> None:
-        with self.lock:
-            if isinstance(page, str):
-                self.pages.discard(page)
-            if not self.pages:
-                self.closing = self.clock()
+            self.pages -= 1
+            self.seen = self.clock()
 
     def finished(self) -> bool:
         with self.lock:
@@ -93,9 +83,7 @@ class App:
                 return False
             if self.key is None:
                 return now - self.started > CODE_SECONDS
-            if self.closing is not None and now - self.closing > CLOSE_SECONDS:
-                return True
-            return now - self.seen > IDLE_SECONDS
+            return self.pages == 0 and now - self.seen > CLOSE_SECONDS
 
     def report(self) -> dict:
         with self.lock:
@@ -124,10 +112,6 @@ class App:
             return False
         self.show(path)
         return True
-
-    def _touch(self):
-        self.seen = self.clock()
-        self.closing = None
 
 
 def make_server(app: App) -> ThreadingHTTPServer:
@@ -170,15 +154,13 @@ class _Handler(BaseHTTPRequestHandler):
         action = {
             "/api/report": self._report,
             "/api/show": self._show,
-            "/api/here": self._here,
-            "/api/leave": self._leave,
+            "/api/stay": self._stay,
         }.get(self.path)
         if action is None:
             return self._json(404, {"error": "not found"})
         action(body)
 
     def _report(self, body):
-        self.app.touch()
         try:
             self._json(200, self.app.report())
         except ScanError as error:
@@ -187,20 +169,24 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(500, {"error": "Couldn't finish checking"})
 
     def _show(self, body):
-        self.app.touch()
         try:
             found = self.app.show_file(body.get("name"))
         except OSError:
             return self._json(500, {"error": "Your file manager didn't open"})
         self._json(200, {}) if found else self._json(404, {"error": "That file isn't there any more"})
 
-    def _here(self, body):
-        self.app.arrive(body.get("page"))
-        self._json(200, {})
-
-    def _leave(self, body):
-        self.app.leave(body.get("page"))
-        self._json(200, {})
+    def _stay(self, body):
+        # The page keeps this open. When it closes, however it closes, the next write fails.
+        self.app.arrive()
+        try:
+            self._head(200, "text/plain")
+            while True:
+                self.wfile.write(b".")
+                time.sleep(BEAT_SECONDS)
+        except OSError:
+            pass
+        finally:
+            self.app.leave()
 
     def _from_this_page(self):
         here = f"{HOST}:{self.server.server_address[1]}"
@@ -234,18 +220,22 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(status, json.dumps(value).encode(), "application/json")
 
     def _send(self, status, content, kind):
-        self.close_connection = True
         try:
-            self.send_response(status)
-            for name, value in HEADERS.items():
-                self.send_header(name, value)
-            self.send_header("Content-Type", kind)
-            self.send_header("Content-Length", str(len(content)))
-            self.send_header("Connection", "close")
-            self.end_headers()
+            self._head(status, kind, len(content))
             self.wfile.write(content)
         except ConnectionError:
             pass
+
+    def _head(self, status, kind, length=None):
+        self.close_connection = True
+        self.send_response(status)
+        for name, value in HEADERS.items():
+            self.send_header(name, value)
+        self.send_header("Content-Type", kind)
+        if length is not None:
+            self.send_header("Content-Length", str(length))
+        self.send_header("Connection", "close")
+        self.end_headers()
 
     def send_error(self, code, message=None, explain=None):
         self._json(code, {"error": "bad request"})
