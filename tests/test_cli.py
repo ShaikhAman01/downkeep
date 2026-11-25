@@ -36,6 +36,24 @@ class CliTest(FolderTest):
         code, out, _ = run("report", str(self.folder), "--json", "--top", "1")
         self.assertEqual((code, json.loads(out)["files"]), (0, 1))
 
+    def test_proof_is_included(self):
+        self.add("a.txt", b"same")
+        self.add("b.txt", b"same")
+        with mock.patch("downkeep.cli.find_hosts", side_effect=lambda paths: {path: "x.example" for path in paths}):
+            result = json.loads(run("report", str(self.folder), "--json")[1])
+        self.assertEqual(result["duplicates"][0]["names"], ["a.txt", "b.txt"])
+        self.assertEqual(result["sites"]["known"][0]["files"], 2)
+        self.assertEqual(result["extracted"], [])
+
+    def test_quick_reads_no_contents(self):
+        self.add("a.txt", b"same")
+        self.add("b.txt", b"same")
+        for name in ["find_hosts", "find_duplicates", "find_extracted"]:
+            patch = mock.patch(f"downkeep.cli.{name}", side_effect=AssertionError("not quick"))
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.assertEqual(run("report", str(self.folder), "--quick")[0], 0)
+
     def test_default_folder(self):
         self.add("a.zip")
         with mock.patch("downkeep.cli.downloads_folder", return_value=self.folder):

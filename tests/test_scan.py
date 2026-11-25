@@ -26,6 +26,14 @@ class ScanTest(FolderTest):
         self.assertEqual((file.device, file.inode, file.links), (info.st_dev, info.st_ino, 1))
         self.assertEqual(file.mtime_ns, info.st_mtime_ns)
 
+    def test_extensions(self):
+        for name, expected in {"a.TAR.GZ": ".tar.gz", "b.pkg.tar.zst": ".tar.zst", "c.tar": ".tar", "d": "", "e.gz": ".gz", "tar.gz": ".gz"}.items():
+            with self.subTest(name=name):
+                (self.folder / name).unlink(missing_ok=True)
+                path = self.add(name)
+                self.assertEqual(scan(self.folder).files[0].extension, expected)
+                path.unlink()
+
     def test_files_are_in_name_order(self):
         for name in ["c.txt", "a.txt", "b.txt"]:
             self.add(name)

@@ -1,6 +1,7 @@
 import json
 import unittest
 
+from downkeep.evidence import Duplicates, Extracted
 from downkeep.report import as_json, as_text, build, clean, human
 from downkeep.scan import FileRecord, Snapshot, scan
 from tests.helpers import FolderTest
@@ -82,6 +83,55 @@ class ReportTest(unittest.TestCase):
         for size, expected in cases.items():
             with self.subTest(size=size):
                 self.assertEqual(human(size), expected)
+
+
+class ProofTest(unittest.TestCase):
+    files = [record("a.zip", 100), record("b.zip", 50), record("c.txt", 5)]
+
+    def test_sites(self):
+        result = report(*self.files, hosts={"a.zip": "x.example", "b.zip": "x.example"})
+        self.assertEqual(
+            result["sites"],
+            {"known": [{"site": "x.example", "files": 2, "bytes": 150}], "unknown": {"files": 1, "bytes": 5}},
+        )
+        text = as_text(result)
+        self.assertIn("Probably from", text)
+        self.assertRegex(text, r"unknown +1 ")
+
+    def test_many_sites_are_grouped(self):
+        files = [record(f"{index}", 1) for index in range(12)]
+        text = as_text(report(*files, hosts={str(index): f"s{index}.example" for index in range(12)}), rows=8)
+        self.assertRegex(text, r"4 other sites +4 ")
+        self.assertNotIn("unknown", text)
+
+    def test_copies(self):
+        result = report(*self.files, duplicates=[Duplicates((record("one", 40), record("two", 40), record("ev\x1bil", 40)))])
+        self.assertEqual(result["duplicates"][0]["wasted"], 80)
+        text = as_text(result)
+        self.assertIn("Exact copies: 2 extra, 80 B (contents compared)", text)
+        self.assertIn("one  =  two  =  ev\N{REPLACEMENT CHARACTER}il", text)
+
+    def test_extracted_zips(self):
+        result = report(
+            *self.files,
+            extracted=[Extracted(self.files[0], "/downloads", 1), Extracted(self.files[1], "/downloads/b", 3)],
+        )
+        text = as_text(result)
+        self.assertIn("Zips already extracted: 2, 150 B (every file checked)", text)
+        self.assertIn("a.zip  (1 file in this folder)", text)
+        self.assertIn("b.zip  (3 files in b)", text)
+
+    def test_long_lists_are_cut_in_text_only(self):
+        groups = [Duplicates((record(f"{index}a", 4), record(f"{index}b", 4))) for index in range(10)]
+        result = report(*self.files, duplicates=groups)
+        self.assertEqual(len(result["duplicates"]), 10)
+        self.assertIn("and 2 more", as_text(result, rows=8))
+        self.assertNotIn("more (see", as_text(result, rows=10))
+
+    def test_quick_report_has_no_proof(self):
+        result = report(*self.files)
+        self.assertFalse({"sites", "duplicates", "extracted"} & result.keys())
+        self.assertNotIn("Probably", as_text(result))
 
 
 class ReportFromDiskTest(FolderTest):

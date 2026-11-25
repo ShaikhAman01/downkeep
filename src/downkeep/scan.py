@@ -26,7 +26,8 @@ class FileRecord:
 
     @property
     def extension(self) -> str:
-        return os.path.splitext(self.name)[1].lower()
+        stem, last = os.path.splitext(self.name.lower())
+        return ".tar" + last if last and stem.endswith(".tar") else last
 
 
 @dataclass(frozen=True, slots=True)
