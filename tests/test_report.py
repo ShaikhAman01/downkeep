@@ -136,7 +136,7 @@ class ProofTest(unittest.TestCase):
 
 class ReportFromDiskTest(FolderTest):
     def test_real_folder(self):
-        self.add("a.zip", b"x" * 2000, days=200)
+        self.add("a.zip", b"x" * 2000, days=200.5)
         self.add("b.txt", b"x" * 500, days=2)
         result = build(scan(self.folder))
         self.assertEqual((result["files"], result["bytes"]), (2, 2500))

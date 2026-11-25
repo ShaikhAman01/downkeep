@@ -111,7 +111,7 @@ def _classify(entry, names, now_ns):
         return "unfinished downloads", info
     if info.st_size == 0:
         return "empty files", info
-    if 0 <= now_ns - info.st_mtime_ns < SETTLE_SECONDS * 1_000_000_000:
+    if abs(now_ns - info.st_mtime_ns) < SETTLE_SECONDS * 1_000_000_000:
         return "changed in the last minute", info
     return None, info
 

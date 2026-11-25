@@ -85,6 +85,12 @@ class ScanTest(FolderTest):
         self.add("future.txt", days=-400)
         self.assertEqual(self.names(scan(self.folder)), ["future.txt"])
 
+    def test_file_dated_just_ahead_of_the_clock_is_still_fresh(self):
+        path = self.add("fresh.txt", days=1)
+        snapshot = scan(self.folder, now_ns=path.stat().st_mtime_ns - 10_000_000)
+        self.assertEqual(self.names(snapshot), [])
+        self.assertEqual(snapshot.skipped, {"changed in the last minute": 1})
+
     def test_links_are_not_followed(self):
         target = self.add("real.txt")
         self.symlink("link.txt", target)
