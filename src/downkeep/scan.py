@@ -47,7 +47,7 @@ def check_folder(folder: str | os.PathLike) -> Path:
     try:
         resolved = path.resolve(strict=True)
     except (OSError, RuntimeError) as error:
-        raise ScanError(f"Can't open {path}: {error}") from error
+        raise ScanError(f"Can't open {path}: {getattr(error, 'strerror', None) or error}") from error
     if not resolved.is_dir():
         raise ScanError(f"{path} is not a folder")
     if resolved == Path(resolved.anchor):

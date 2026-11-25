@@ -18,6 +18,7 @@ MAX_MEMBERS = 10_000
 MAX_DIRECTORY = 16 * 1024 * 1024
 MAX_INDEX = 200_000
 MAX_CANDIDATES = 20
+EXAMPLES = 3
 NEVER_ENTER = {".git", ".hg", ".venv", "__pycache__", "node_modules", "venv"}
 
 
@@ -35,6 +36,7 @@ class Extracted:
     archive: FileRecord
     folder: str
     members: int
+    names: tuple[str, ...] = ()
 
 
 class Changed(Exception):
@@ -62,7 +64,8 @@ def find_extracted(files: Iterable[FileRecord], folder: str) -> list[Extracted]:
         members = _members(archive)
         where = _find_folder(members, sizes, by_name) if members else None
         if where:
-            found.append(Extracted(archive, where, len(members)))
+            examples = tuple(parts[-1] for parts in sorted(members)[:EXAMPLES])
+            found.append(Extracted(archive, where, len(members), examples))
     return sorted(found, key=lambda item: (-item.archive.size, item.archive.name))
 
 

@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Downkeep</title>
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" type="module"></script>
+</head>
+<body>
+  <div id="app" class="app plain">
+    <header class="side">
+      <div class="top">
+        <p class="name">Downkeep</p>
+        <button id="again" class="link" type="button" hidden>Check again</button>
+      </div>
+      <div id="sum"></div>
+    </header>
+    <nav id="list" aria-label="Files"></nav>
+    <main id="main" class="stage">
+      <noscript><p class="say">Downkeep needs JavaScript. It runs only on your computer.</p></noscript>
+    </main>
+  </div>
+  <p id="status" class="toast" role="status"></p>
+</body>
+</html>

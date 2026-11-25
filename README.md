@@ -10,9 +10,10 @@ right now it only reports. it never moves, changes or deletes a file.
 
 ```bash
 pip install .
-downkeep report
+downkeep          # opens a window
+downkeep report   # stays in the terminal
 ```
 
-to prove a copy it reads files of equal size, and to prove a zip is extracted it compares checksums. nothing leaves your computer. `--quick` skips all of that.
+to prove a copy it reads files of equal size, and to prove a zip is extracted it compares checksums. nothing leaves your computer: the window is served from your own machine and only answers to itself. `report --quick` skips all of that.
 
 needs python 3.12 or newer. no dependencies. linux, macos and windows.

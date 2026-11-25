@@ -25,6 +25,43 @@ def run(*args):
 
 
 class CliTest(FolderTest):
+    def setUp(self):
+        super().setUp()
+        patch = mock.patch("downkeep.cli.open_window", side_effect=AssertionError("opened a real window"))
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_plain_command_opens_the_window_and_stops_when_it_closes(self):
+        for args in [(), ("open",), ("open", str(self.folder))]:
+            with self.subTest(args=args):
+                with (
+                    mock.patch("downkeep.cli.downloads_folder", return_value=self.folder),
+                    mock.patch("downkeep.cli.open_window") as window,
+                    mock.patch("downkeep.cli.App.finished", return_value=True),
+                ):
+                    code, out, err = run(*args)
+                self.assertEqual((code, err), (0, ""))
+                self.assertRegex(window.call_args.args[0], r"^http://127\.0\.0\.1:\d+/#.{40,}$")
+                self.assertNotIn("http", out)
+
+    def test_open_without_a_browser_prints_the_link(self):
+        with mock.patch("downkeep.cli.App.finished", return_value=True):
+            code, out, _ = run("open", str(self.folder), "--no-browser")
+        self.assertEqual(code, 0)
+        self.assertRegex(out, r"^http://127\.0\.0\.1:\d+/#")
+
+    def test_open_prints_the_link_when_no_browser_opens(self):
+        with (
+            mock.patch("downkeep.cli.open_window", return_value=False),
+            mock.patch("downkeep.cli.App.finished", return_value=True),
+        ):
+            out = run("open", str(self.folder))[1]
+        self.assertRegex(out, r"\nhttp://127\.0\.0\.1:\d+/#")
+
+    def test_open_with_a_bad_folder_starts_nothing(self):
+        with mock.patch("downkeep.cli.make_server", side_effect=AssertionError("started")):
+            self.assertEqual(run("open", str(self.folder / "missing"))[0], 2)
+
     def test_text_report(self):
         self.add("a.zip", b"x" * 2000)
         code, out, err = run("report", str(self.folder))
@@ -65,7 +102,7 @@ class CliTest(FolderTest):
         self.assertIn("downkeep: Can't open", err)
 
     def test_bad_arguments(self):
-        for args in [(), ("report", "--top", "-1"), ("report", "--top", "x"), ("delete",)]:
+        for args in [("report", "--top", "-1"), ("report", "--top", "x"), ("delete",)]:
             with self.subTest(args=args):
                 self.assertEqual(run(*args)[0], 2)
 

@@ -149,6 +149,16 @@ class ExtractedTest(FolderTest):
     def found(self):
         return find_extracted(scan(self.folder).files, str(self.folder.resolve()))
 
+    def test_examples_are_a_few_names_without_folders(self):
+        files = {f"d/{letter}.txt": letter.encode() for letter in "edcba"}
+        self.zip(files=files)
+        for name, content in files.items():
+            path = self.folder / name
+            path.parent.mkdir(exist_ok=True)
+            path.write_bytes(content)
+        found = find_extracted(scan(self.folder).files, str(self.folder))
+        self.assertEqual(found[0].names, ("a.txt", "b.txt", "c.txt"))
+
     def test_fully_extracted(self):
         self.zip()
         self.extract()

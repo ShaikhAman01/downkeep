@@ -64,6 +64,8 @@ def build(
             {"names": [file.name for file in group.files], "bytes_each": group.files[0].size, "wasted": group.wasted}
             for group in duplicates
         ]
+    if duplicates is not None and extracted is not None:
+        result["proven"] = _proven(duplicates, extracted)
     if extracted is not None:
         result["extracted"] = [
             {
@@ -71,10 +73,18 @@ def build(
                 "bytes": item.archive.size,
                 "folder": os.path.relpath(item.folder, snapshot.folder),
                 "files": item.members,
+                "examples": list(item.names),
             }
             for item in extracted
         ]
     return result
+
+
+def _proven(duplicates, extracted):
+    """Files with proof, each counted once even if it is both a copy and an extracted zip."""
+    found = {file.path: file.size for group in duplicates for file in group.files[1:]}
+    found |= {item.archive.path: item.archive.size for item in extracted}
+    return {"files": len(found), "bytes": sum(found.values())}
 
 
 def _sites(snapshot, hosts):
