@@ -16,6 +16,7 @@ const KINDS = {
 const KIND = new Map(Object.entries(KINDS).flatMap(([kind, names]) => names.split(" ").map((name) => [name, kind])));
 
 let key = null;
+let version = "";
 let hidden = 0;
 
 const plural = (count, one, many = `${one}s`) => `${count.toLocaleString()} ${count === 1 ? one : many}`;
@@ -64,6 +65,10 @@ function icon(kind) {
     v("path", { d: "M3 1h9l6 6v12a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V2a1 1 0 0 1 1-1z", class: `k-${kind}` }),
     v("path", { d: "M12 1l6 6h-5a1 1 0 0 1-1-1z", class: "fold" }));
 }
+
+const folderIcon = () => v("svg", { width: 22, height: 20, viewBox: "0 0 22 20", "aria-hidden": "true" },
+  v("path", { d: "M2 4a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v2H2z", class: "back" }),
+  v("path", { d: "M1 8.500a1.500 1.500 0 0 1 1.500-1.500h17a1.500 1.500 0 0 1 1.500 1.600l-.8 8a2 2 0 0 1-2 1.900H3.800a2 2 0 0 1-2-1.900z", class: "front" }));
 
 const label = (text, x, y, width, style) => v("text", { x, y, class: style, "data-width": width }, clean(text));
 
@@ -151,14 +156,17 @@ const words = h("div", { "aria-live": "polite" });
 const body = h("div", { class: "art" });
 const acts = h("div", { class: "acts" });
 const foot = h("p", { class: "foot" });
+let footnote = "";
 
-function stage({ say, what, why, art, buttons = [] }) {
+function stage({ say, what, why, art, buttons = [], note = footnote }) {
   words.replaceChildren(
     h("h2", { class: "say" }, say),
     ...(what ? [h("p", { class: "what" }, ...what)] : []),
     ...(why ? [h("p", { class: "why" }, why)] : []),
   );
-  body.className = art?.classList.contains("more") ? "wide" : "art";
+  body.className = art instanceof SVGElement ? "art" : "wide";
+  foot.textContent = note;
+  foot.hidden = !note;
   body.replaceChildren(...(art ? [art] : []));
   acts.hidden = !buttons.length;
   acts.replaceChildren(...buttons);
@@ -210,7 +218,7 @@ function draw(report) {
   function open(item, move = false) {
     buttons.forEach((button, other) => button.setAttribute("aria-current", String(other === item)));
     const place = shown.indexOf(item);
-    if (item.more) stage({ say: "More about this folder", what: [bdi(report.folder)], art: moreAbout(report) });
+    if (item.more) stage({ say: "More about this folder", what: [bdi(report.folder)], art: moreAbout(report), note: [footnote, version && `Downkeep ${version}.`].filter(Boolean).join(" ") });
     else {
       const where = item.folder === "." ? home : item.folder;
       const next = () => {
@@ -272,26 +280,33 @@ function draw(report) {
     : [h("h1", { tabindex: "-1" }, report.files ? "Nothing proven" : "No files to check"), ...(report.files ? [h("p", {}, `${human(report.bytes)} in ${plural(report.files, "file")}`)] : [])]));
 
   const time = new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
-  foot.textContent = sample
+  footnote = sample
     ? "This is made-up data. Nothing on your computer was read."
     : `Checked at ${time}. Nothing was moved, changed or deleted, and nothing left your computer.`;
 
+  const where = h("div", { class: "where" }, bdi(home),
+    h("button", { class: "link", type: "button", onclick: () => pickFolder(() => first()) }, "Change folder"));
+  if (!sample) sum.append(where);
+
   app.classList.remove("plain");
-  if (proven.length) open(shown[0]);
-  else {
+  const first = () => {
+    if (proven.length) return open(shown[0]);
     buttons.forEach((button) => button.setAttribute("aria-current", "false"));
     stage(report.files
       ? { say: "Nothing here is proven clutter", why: "There are no exact copies, and no zip whose every file was found. So everything stays.", art: lone(home, plural(report.files, "file")) }
       : { say: "There are no finished files here", why: "Hidden, empty and unfinished files are not counted.", art: lone(home, "nothing to check") });
-  }
+  };
+  first();
 }
 
-function message(title, ...lines) {
+function message(title, lines, buttons = []) {
   app.classList.add("plain");
   list.replaceChildren();
   sum.replaceChildren();
   main.replaceChildren(h("h1", { class: "say", tabindex: "-1" }, title), ...lines.map((line) => h("p", { class: "why" }, clean(line))));
+  if (buttons.length) main.append(h("div", { class: "acts" }, ...buttons));
   main.append(h("div", { class: "art" }, lone("Downkeep", "")));
+  if (version) main.append(h("p", { class: "foot" }, `Downkeep ${version}`));
   main.querySelector("h1").focus({ preventScroll: true });
 }
 
@@ -312,7 +327,7 @@ async function ask(path, body = {}) {
 
 function closed() {
   again.hidden = true;
-  message("Downkeep has closed", "Open it again to see your files. Nothing was changed.");
+  message("Downkeep has closed", ["Open it again to see your files. Nothing was changed."]);
 }
 
 async function showFile(text) {
@@ -328,7 +343,7 @@ async function showFile(text) {
 async function check() {
   again.disabled = true;
   status.textContent = "";
-  message("Checking your files", "Reading names, comparing files of the same size, and looking inside zips.", "Big folders can take a minute. Nothing is being changed.");
+  message("Checking your files", ["Reading names, comparing files of the same size, and looking inside zips.", "Big folders can take a minute. Nothing is being changed."]);
   main.querySelector(".art").before(h("div", { class: "progress", "aria-hidden": "true" }));
   main.setAttribute("aria-busy", "true");
   let report;
@@ -336,10 +351,14 @@ async function check() {
     report = sample ? await (await fetch(sample)).json() : await ask("/api/report");
   } catch (error) {
     if (error.status === 403) return expired();
-    if (error.status === 409) message("Couldn't check this folder", error.message);
-    else if (error.status) message("Something went wrong", "Downkeep couldn't finish checking. Nothing was changed.");
-    else return closed();
-    again.hidden = false;
+    if (!error.status) return closed();
+    again.hidden = true;
+    const buttons = sample ? [] : [
+      h("button", { class: "main-act", type: "button", onclick: () => pickFolder(check) }, "Choose a folder"),
+      h("button", { class: "next", type: "button", onclick: check }, "Try again"),
+    ];
+    if (error.status === 409) message("Couldn't check this folder", [error.message, "Nothing was changed."], buttons);
+    else message("Something went wrong", ["Downkeep couldn't finish checking. Nothing was changed."], buttons);
     return;
   } finally {
     again.disabled = false;
@@ -350,9 +369,67 @@ async function check() {
   sum.querySelector("h1").focus({ preventScroll: true });
 }
 
+async function pickFolder(back, path = []) {
+  let folders;
+  try {
+    ({ folders } = await ask("/api/folders", { path }));
+  } catch (error) {
+    if (!error.status) return closed();
+    return error.status === 403 ? expired() : toast(error.message);
+  }
+  let picked = null;
+  const here = path.at(-1);
+  const checkIt = h("button", { class: "main-act", type: "button", onclick: () => chooseFolder(picked ? [...path, picked] : path) });
+  const openIt = h("button", { class: "next", type: "button", onclick: () => pickFolder(back, [...path, picked]) });
+  const cancel = h("button", { class: "next", type: "button", onclick: back }, "Cancel");
+  const rows = folders.map((name) => h("button", {
+    class: "folder", type: "button", "aria-pressed": "false",
+    onclick: () => { picked = name; update(); },
+  }, folderIcon(), bdi(name)));
+  rows.forEach((row, index) => row.addEventListener("dblclick", () => pickFolder(back, [...path, folders[index]])));
+
+  function update() {
+    rows.forEach((row, index) => row.setAttribute("aria-pressed", String(folders[index] === picked)));
+    const target = picked ?? here;
+    checkIt.hidden = !target;
+    openIt.hidden = !picked;
+    checkIt.replaceChildren("Check ", bdi(target ?? ""));
+    openIt.replaceChildren("Open ", bdi(picked ?? ""));
+  }
+
+  const trail = ["Home", ...path].map((name, index) => index === path.length
+    ? h("b", { "aria-current": "location" }, bdi(name))
+    : h("button", { type: "button", onclick: () => pickFolder(back, path.slice(0, index)) }, bdi(name)));
+  update();
+  list.querySelectorAll(".item").forEach((button) => button.setAttribute("aria-current", "false"));
+  stage({
+    say: "Choose a folder to check",
+    why: "Only folder names are read until you press Check. Nothing is changed.",
+    art: h("div", { class: "picker" },
+      h("nav", { class: "trail", "aria-label": "Folders above" }, ...trail),
+      rows.length ? h("ul", {}, ...rows.map((row) => h("li", {}, row))) : h("p", { class: "why" }, "No folders inside this one.")),
+    buttons: [checkIt, openIt, cancel],
+    note: "Hidden folders, links, your whole home folder and other drives aren't available here.",
+  });
+  const title = words.querySelector("h2");
+  title.tabIndex = -1;
+  title.focus({ preventScroll: true });
+  if (matchMedia("(max-width: 48rem)").matches) main.scrollIntoView();
+}
+
+async function chooseFolder(path) {
+  try {
+    await ask("/api/choose", { path });
+  } catch (error) {
+    if (!error.status) return closed();
+    return error.status === 403 ? expired() : toast(error.message);
+  }
+  await check();
+}
+
 function expired() {
   again.hidden = true;
-  message("This link has expired", "Open Downkeep again to get a fresh window. Each link works once, so nobody else can use it.");
+  message("This link has expired", ["Open Downkeep again to get a fresh window. Each link works once, so nobody else can use it."]);
 }
 
 async function stay() {
@@ -369,11 +446,15 @@ async function start() {
   if (sample) return check();
   const code = decodeURIComponent(location.hash.slice(1));
   history.replaceState(null, "", "/");
-  key = sessionStorage.getItem("key");
   try {
-    if (code) key = (await ask("/api/session", { code })).key;
+    if (code) {
+      const session = await ask("/api/session", { code });
+      sessionStorage.setItem("key", session.key);
+      sessionStorage.setItem("version", session.version);
+    }
+    key = sessionStorage.getItem("key");
+    version = sessionStorage.getItem("version") ?? "";
     if (!key) return expired();
-    sessionStorage.setItem("key", key);
   } catch (error) {
     return error.status ? expired() : closed();
   }

@@ -3,6 +3,7 @@ import shutil
 import subprocess
 import sys
 import webbrowser
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
@@ -38,6 +39,46 @@ def show_in_folder(path: str) -> None:
         _start(["/usr/bin/open", "-R", path])
     elif not _ask_file_manager(path):
         _start(["xdg-open", os.path.dirname(path)])
+
+
+def tell(text: str) -> None:
+    """Shows a message without a terminal, and always keeps a copy in the log."""
+    try:
+        place = _log_file()
+        place.parent.mkdir(parents=True, exist_ok=True)
+        with open(place, "a", encoding="utf-8") as log:
+            log.write(f"{datetime.now():%Y-%m-%d %H:%M} {text}\n")
+    except OSError:
+        pass
+    try:
+        _message(text)
+    except OSError:
+        pass
+
+
+def _log_file():
+    home = Path.home()
+    if sys.platform == "win32":
+        return Path(os.environ.get("LOCALAPPDATA") or home / "AppData" / "Local", "Downkeep", "log.txt")
+    if sys.platform == "darwin":
+        return home / "Library" / "Logs" / "Downkeep.log"
+    return Path(os.environ.get("XDG_STATE_HOME") or home / ".local" / "state", "downkeep", "log.txt")
+
+
+def _message(text):
+    if sys.platform == "win32":
+        import ctypes
+
+        ctypes.windll.user32.MessageBoxW(None, text, "Downkeep", 0)
+    elif sys.platform == "darwin":
+        script = 'on run argv\ndisplay dialog (item 1 of argv) with title "Downkeep" buttons {"OK"}\nend run'
+        _start(["/usr/bin/osascript", "-e", script, text])
+    elif shutil.which("zenity"):
+        _start(["zenity", "--info", "--no-markup", "--title=Downkeep", f"--text={text}"])
+    elif shutil.which("kdialog"):
+        _start(["kdialog", "--title", "Downkeep", "--msgbox", text])
+    elif shutil.which("notify-send"):
+        _start(["notify-send", "Downkeep", text])
 
 
 def _app_browser():

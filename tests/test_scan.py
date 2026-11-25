@@ -1,12 +1,14 @@
 import os
+import stat
 import subprocess
 import sys
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
-from downkeep.scan import ScanError, scan
+from downkeep.scan import ScanError, is_hidden, scan
 from tests.helpers import DAY, FolderTest
 
 
@@ -90,6 +92,18 @@ class ScanTest(FolderTest):
         snapshot = scan(self.folder, now_ns=path.stat().st_mtime_ns - 10_000_000)
         self.assertEqual(self.names(snapshot), [])
         self.assertEqual(snapshot.skipped, {"changed in the last minute": 1})
+
+    def test_hidden_flags_of_windows_and_mac(self):
+        def info(attributes=0, flags=0):
+            return SimpleNamespace(st_file_attributes=attributes, st_flags=flags)
+
+        self.assertFalse(is_hidden("a", info()))
+        self.assertFalse(is_hidden("a", SimpleNamespace()))
+        self.assertTrue(is_hidden("a", info(attributes=stat.FILE_ATTRIBUTE_HIDDEN)))
+        self.assertTrue(is_hidden("a", info(attributes=stat.FILE_ATTRIBUTE_SYSTEM)))
+        self.assertFalse(is_hidden("a", info(attributes=stat.FILE_ATTRIBUTE_DIRECTORY)))
+        self.assertTrue(is_hidden("a", info(flags=stat.UF_HIDDEN)))
+        self.assertTrue(is_hidden(".a", info()))
 
     def test_links_are_not_followed(self):
         target = self.add("real.txt")

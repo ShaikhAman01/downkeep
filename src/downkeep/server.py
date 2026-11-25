@@ -7,7 +7,10 @@ import time
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
+from pathlib import Path
 
+from downkeep import __version__
+from downkeep.browse import choose, inside, subfolders
 from downkeep.evidence import find_duplicates, find_extracted
 from downkeep.origin import find_hosts
 from downkeep.report import build, clean
@@ -41,8 +44,15 @@ HEADERS = {
 class App:
     """One folder, one window. The launch code works once and is swapped for a key the page keeps."""
 
-    def __init__(self, folder: str, show: Callable[[str], None], clock: Callable[[], float] = time.monotonic):
+    def __init__(
+        self,
+        folder: str,
+        show: Callable[[str], None],
+        clock: Callable[[], float] = time.monotonic,
+        home: Path | None = None,
+    ):
         self.folder = folder
+        self.home = home or Path.home()
         self.show = show
         self.clock = clock
         self.code = secrets.token_urlsafe(32)
@@ -90,7 +100,9 @@ class App:
             self.working += 1
         try:
             with self.scanning:
-                snapshot = scan(self.folder)
+                with self.lock:
+                    folder = self.folder
+                snapshot = scan(folder)
                 result = build(
                     snapshot,
                     hosts=find_hosts(file.path for file in snapshot.files),
@@ -98,12 +110,19 @@ class App:
                     extracted=find_extracted(snapshot.files, snapshot.folder),
                 )
             with self.lock:
-                self.paths = {file.name: file.path for file in snapshot.files}
+                if self.folder == folder:
+                    self.paths = {file.name: file.path for file in snapshot.files}
             return result
         finally:
             with self.lock:
                 self.working -= 1
                 self.seen = self.clock()
+
+    def choose(self, parts: object) -> None:
+        folder = str(choose(self.home, parts))
+        with self.lock:
+            self.folder = folder
+            self.paths = {}
 
     def show_file(self, name: object) -> bool:
         with self.lock:
@@ -148,12 +167,14 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/api/session":
             key = self.app.open_session(body.get("code"))
-            return self._json(200, {"key": key}) if key else self._json(403, {"error": "link expired"})
+            return self._json(200, {"key": key, "version": __version__}) if key else self._json(403, {"error": "link expired"})
         if not self.app.allows(self.headers.get("X-Downkeep-Key")):
             return self._json(403, {"error": "not allowed"})
         action = {
             "/api/report": self._report,
             "/api/show": self._show,
+            "/api/folders": self._folders,
+            "/api/choose": self._choose,
             "/api/stay": self._stay,
         }.get(self.path)
         if action is None:
@@ -174,6 +195,19 @@ class _Handler(BaseHTTPRequestHandler):
         except OSError:
             return self._json(500, {"error": "Your file manager didn't open"})
         self._json(200, {}) if found else self._json(404, {"error": "That file isn't there any more"})
+
+    def _folders(self, body):
+        try:
+            self._json(200, {"folders": subfolders(inside(self.app.home, body.get("path")))})
+        except ScanError as error:
+            self._json(409, {"error": clean(str(error))})
+
+    def _choose(self, body):
+        try:
+            self.app.choose(body.get("path"))
+        except ScanError as error:
+            return self._json(409, {"error": clean(str(error))})
+        self._json(200, {})
 
     def _stay(self, body):
         # The page keeps this open. When it closes, however it closes, the next write fails.

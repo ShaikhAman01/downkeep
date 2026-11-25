@@ -36,7 +36,7 @@ class ServerTest(FolderTest):
         patch = mock.patch("downkeep.server.BEAT_SECONDS", 0.02)
         patch.start()
         self.addCleanup(patch.stop)
-        self.app = App(str(self.folder), self.shown.append, self.clock)
+        self.app = App(str(self.folder), self.shown.append, self.clock, home=self.folder.parent)
         self.server = make_server(self.app)
         threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
         self.addCleanup(self.server.server_close)
@@ -141,7 +141,7 @@ class ServerTest(FolderTest):
     def test_nothing_works_without_the_key(self):
         self.assertEqual(self.call("/api/report", "")[0], 403)
         key = self.key()
-        for path in ["/api/report", "/api/show", "/api/stay", "/api/unknown"]:
+        for path in ["/api/report", "/api/show", "/api/folders", "/api/choose", "/api/stay", "/api/unknown"]:
             for wrong in ["", "x", self.app.code, key[:-1]]:
                 with self.subTest(path=path, wrong=wrong):
                     self.assertEqual(self.call(path, wrong)[0], 403)
@@ -186,6 +186,60 @@ class ServerTest(FolderTest):
         status, content, _ = self.call("/api/report", self.key())
         self.assertEqual(status, 409)
         self.assertIn("Can't open", json.loads(content)["error"])
+
+    def test_folders(self):
+        key = self.key()
+        (self.folder / "inner").mkdir()
+        (self.folder.parent / "Music").mkdir()
+        status, content, _ = self.call("/api/folders", key, {"path": []})
+        self.assertEqual((status, json.loads(content)), (200, {"folders": ["Downloads", "Music"]}))
+        self.assertEqual(json.loads(self.call("/api/folders", key, {"path": ["Downloads"]})[1]), {"folders": ["inner"]})
+        for path in [[".."], ["missing"], None, "Music", ["Downloads", ".."]]:
+            with self.subTest(path=path):
+                self.assertEqual(self.call("/api/folders", key, {"path": path})[0], 409)
+                self.assertEqual(self.call("/api/choose", key, {"path": path})[0], 409)
+        self.assertEqual(self.call("/api/choose", key, {"path": []})[0], 409)
+        self.assertEqual(self.app.folder, str(self.folder))
+
+    def test_choosing_a_folder(self):
+        key = self.key()
+        other = self.folder.parent / "Music"
+        other.mkdir()
+        song = other / "song.mp3"
+        song.write_bytes(b"la")
+        os.utime(song, (1, 1))
+        self.call("/api/report", key)
+        self.assertEqual(self.call("/api/choose", key, {"path": ["Music"]})[0], 200)
+        self.assertEqual(self.call("/api/show", key, {"name": "a.txt"})[0], 404)
+        result = json.loads(self.call("/api/report", key)[1])
+        self.assertEqual((result["folder"], result["files"]), (str(other), 1))
+        self.assertEqual(self.call("/api/show", key, {"name": "song.mp3"})[0], 200)
+        self.assertEqual(self.shown, [str(song)])
+
+    def test_choosing_during_a_scan_does_not_mix_folders(self):
+        key = self.key()
+        (self.folder.parent / "Music").mkdir()
+        real = server.find_duplicates
+
+        def switch(files):
+            self.app.choose(["Music"])
+            return real(files)
+
+        with mock.patch("downkeep.server.find_duplicates", switch):
+            self.call("/api/report", key)
+        self.assertEqual(self.call("/api/show", key, {"name": "a.txt"})[0], 404)
+
+    def test_two_windows_are_separate(self):
+        other = App(str(self.folder), self.shown.append, self.clock)
+        second = make_server(other)
+        self.addCleanup(second.server_close)
+        self.assertNotEqual(second.server_address[1], self.port)
+        self.assertEqual(self.ask("POST", "/api/session", {"code": other.code})[0], 403)
+        self.assertFalse(other.allows(self.key()))
+
+    def test_session_tells_the_version(self):
+        content = self.ask("POST", "/api/session", {"code": self.app.code})[1]
+        self.assertRegex(json.loads(content)["version"], r"^\d+\.\d+\.\d+$")
 
     def test_show_only_knows_names_from_the_report(self):
         key = self.key()

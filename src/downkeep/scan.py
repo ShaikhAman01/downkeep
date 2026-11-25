@@ -64,7 +64,7 @@ def scan(folder: str | os.PathLike, now_ns: int | None = None) -> Snapshot:
         with os.scandir(root) as listing:
             entries = sorted(listing, key=lambda entry: entry.name)
     except OSError as error:
-        raise ScanError(f"Can't read {root}: {error}") from error
+        raise ScanError(f"Can't read {root}: {error.strerror or error}") from error
 
     names = {entry.name.lower() for entry in entries}
     files = []
@@ -105,7 +105,7 @@ def _classify(entry, names, now_ns):
         return "folders", info
     if not stat.S_ISREG(info.st_mode):
         return "special files", info
-    if _hidden(name, info) or name in SYSTEM:
+    if is_hidden(name, info) or name in SYSTEM:
         return "hidden or system files", info
     if _unfinished(name, names):
         return "unfinished downloads", info
@@ -116,10 +116,10 @@ def _classify(entry, names, now_ns):
     return None, info
 
 
-def _hidden(name, info):
-    attributes = getattr(info, "st_file_attributes", 0)
-    flags = stat.FILE_ATTRIBUTE_HIDDEN | stat.FILE_ATTRIBUTE_SYSTEM
-    return name.startswith((".", "~$")) or bool(attributes & flags)
+def is_hidden(name: str, info: os.stat_result) -> bool:
+    windows = getattr(info, "st_file_attributes", 0) & (stat.FILE_ATTRIBUTE_HIDDEN | stat.FILE_ATTRIBUTE_SYSTEM)
+    mac = getattr(info, "st_flags", 0) & stat.UF_HIDDEN
+    return name.startswith((".", "~$")) or bool(windows or mac)
 
 
 def _unfinished(name, names):

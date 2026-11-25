@@ -2,6 +2,7 @@ import argparse
 import os
 import sys
 import threading
+from collections.abc import Callable
 from urllib.parse import quote
 
 from downkeep import __version__
@@ -32,7 +33,7 @@ def main(argv: list[str] | None = None) -> int:
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(errors="replace")
     if args.command != "report":
-        return _open(getattr(args, "folder", None), getattr(args, "no_browser", False))
+        return open_app(getattr(args, "folder", None), getattr(args, "no_browser", False))
     try:
         result = _report(args)
     except ScanError as error:
@@ -46,9 +47,10 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _open(folder, no_browser):
+def open_app(folder: str | None, no_browser: bool = False, tell: Callable[[str], None] | None = None) -> int:
     try:
-        root = check_folder(folder or downloads_folder())
+        # A missing Downloads folder is shown in the window, where another one can be chosen
+        root = check_folder(folder) if folder else downloads_folder()
     except ScanError as error:
         print(f"downkeep: {clean(str(error))}", file=sys.stderr)
         return 2
@@ -59,10 +61,13 @@ def _open(folder, no_browser):
     try:
         if no_browser:
             print(url, flush=True)
-        elif not open_window(url):
-            print(f"Couldn't open a browser. Open this link within 2 minutes:\n{url}", flush=True)
-        else:
+        elif open_window(url):
             print("Downkeep is open in a window. Close it to stop, or press Ctrl+C here.", flush=True)
+        elif tell:
+            tell("Downkeep couldn't open a web browser. Install one, then open Downkeep again.")
+            return 1
+        else:
+            print(f"Couldn't open a browser. Open this link within 2 minutes:\n{url}", flush=True)
         done = threading.Event()
         while not app.finished():
             done.wait(0.5)

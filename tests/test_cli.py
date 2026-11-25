@@ -58,6 +58,15 @@ class CliTest(FolderTest):
             out = run("open", str(self.folder))[1]
         self.assertRegex(out, r"\nhttp://127\.0\.0\.1:\d+/#")
 
+    def test_missing_downloads_folder_still_opens_the_window(self):
+        with (
+            mock.patch("downkeep.cli.downloads_folder", return_value=self.folder / "missing"),
+            mock.patch("downkeep.cli.open_window", return_value=True) as window,
+            mock.patch("downkeep.cli.App.finished", return_value=True),
+        ):
+            self.assertEqual(run()[0], 0)
+        window.assert_called_once()
+
     def test_open_with_a_bad_folder_starts_nothing(self):
         with mock.patch("downkeep.cli.make_server", side_effect=AssertionError("started")):
             self.assertEqual(run("open", str(self.folder / "missing"))[0], 2)
