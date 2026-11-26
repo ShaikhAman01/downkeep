@@ -7,7 +7,10 @@ import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass, field
+import inspect
+import stat
+import sys
+from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
 from pathlib import Path
@@ -18,13 +21,16 @@ from downkeep.evidence import find_duplicates, find_extracted
 from downkeep.model import ActionError, Busy, Move, Result, Stay
 from downkeep.origin import find_hosts
 from downkeep.report import build, clean
-from downkeep.scan import ScanError, scan
+from downkeep.scan import FileRecord, ScanError, scan
 
 HOST = "127.0.0.1"
 MAX_BODY = 16_384
 MAX_LIST = 1_000_000
 LISTS = {"/api/trash", "/api/tidy/apply", "/api/rules/save", "/api/rules/name"}
 SUGGESTED = 3
+MAX_KEEPERS = 20_000
+RUN_FILES = 5_000
+OTHER_USER = "This link belongs to another account on this computer. Open Downkeep from your own account"
 ENDINGS = {
     "pdf": "A PDF document", "doc": "A Word document", "docx": "A Word document", "odt": "A text document",
     "rtf": "A text document", "txt": "A text file", "md": "A text file", "epub": "A book",
@@ -79,6 +85,7 @@ UNKNOWN = "Some of these files aren't in the list any more. Look again"
 NO_TIDY = "Tidying isn't available on this system yet"
 NO_TRASH = "Moving files to the Trash isn't available on this system yet"
 NO_AUTO = "Automatic tidying isn't available on this system yet"
+NOT_CONFIRMED = "Turning on automatic tidying needs a yes on its confirm step first"
 
 
 class Actions:
@@ -113,10 +120,42 @@ class Actions:
 
         from downkeep.engine import recover
 
+        keep_in = self.keep_in(folder)
         with Store() as store:
             # Moving to the Trash doesn't settle an earlier crash by itself
             recover(store)
+            if keep_in and _takes(apply_clear, "keep_in"):
+                return apply_clear(store, folder, names, keep_in=keep_in)
             return apply_clear(store, folder, names)
+
+    def keep_in(self, folder: str) -> list[str]:
+        """The real folders inside this one that the rules file into. Copies of what is there count as proof."""
+        try:
+            rules = self.rules()["rules"]
+        except (ActionError, ImportError):
+            return []
+        names = dict.fromkeys(rule["folder"] for rule in rules if rule.get("on"))
+        return [name for name in names if _is_folder(os.path.join(folder, name))]
+
+    def keepers(self, folder: str) -> list[FileRecord]:
+        from downkeep import evidence
+
+        finder = getattr(evidence, "find_keepers", None)
+        if finder is not None:
+            try:
+                return finder(folder, self.keep_in(folder))[:MAX_KEEPERS]
+            except OSError:
+                return []
+        found = []
+        for name in self.keep_in(folder):
+            try:
+                files = scan(os.path.join(folder, name)).files
+            except ScanError:
+                continue
+            found += [replace(file, name=f"{name}/{file.name}") for file in files]
+            if len(found) >= MAX_KEEPERS:
+                return found[:MAX_KEEPERS]
+        return found
 
     def plan(self, folder: str) -> tuple[list[Move], list[Stay], list[dict]]:
         from downkeep import sorting
@@ -161,9 +200,21 @@ class Actions:
         from downkeep.store import Store
 
         with Store() as store:
-            return store.history(limit)
+            runs = store.history(limit)
+            for run in runs:
+                run["files"] = _files(store, run["batch"], run["kind"], run["folder"])
+            return runs
 
-    def undo(self, batch: int) -> Result:
+    def run_files(self, batch: int) -> tuple[str, list[dict]]:
+        from downkeep.store import Store
+
+        with Store() as store:
+            found = store.batch(batch)
+            if found is None:
+                raise ActionError("That run isn't in the history")
+            return found.folder, _files(store, batch, found.kind, found.folder, places=True)
+
+    def undo(self, batch: int, names: Sequence[str] | None = None) -> Result:
         from downkeep.engine import undo
         from downkeep.store import Store
 
@@ -171,7 +222,12 @@ class Actions:
             before = store.batch(batch)
             if before is None:
                 raise ActionError("That run isn't in the history")
-            result = undo(store, batch)
+            if names is None:
+                result = undo(store, batch)
+            elif _takes(undo, "names"):
+                result = undo(store, batch, names=list(names))
+            else:
+                raise ActionError("Putting back one file at a time isn't available yet")
             if before.kind == "auto" and result.done:
                 from downkeep.auto import note_undo
 
@@ -249,12 +305,14 @@ class App:
         clock: Callable[[], float] = time.monotonic,
         home: Path | None = None,
         actions: Actions | None = None,
+        same_user: Callable[[tuple, int], bool] | None = None,
     ):
         self.folder = folder
         self.home = home or Path.home()
         self.show = show
         self.clock = clock
         self.actions = actions or Actions()
+        self.same_user = same_user or same_user_here
         self.code = secrets.token_urlsafe(32)
         self.key: str | None = None
         self.paths: dict[str, str] = {}
@@ -324,16 +382,23 @@ class App:
     def report(self) -> dict:
         with self._working() as folder:
             snapshot = scan(folder)
+            keepers = self.actions.keepers(folder) if self.actions.able()["tidy"] else []
+            if keepers and _takes(find_duplicates, "keepers"):
+                duplicates = find_duplicates(snapshot.files, keepers=keepers)
+            else:
+                duplicates = find_duplicates(snapshot.files)
             result = build(
                 snapshot,
                 hosts=find_hosts(file.path for file in snapshot.files),
-                duplicates=find_duplicates(snapshot.files),
+                duplicates=duplicates,
                 extracted=find_extracted(snapshot.files, snapshot.folder),
             )
+            here = {file.name for file in snapshot.files}
             with self.lock:
                 if self.folder == folder:
                     self.paths = {file.name: file.path for file in snapshot.files}
-                    self.proven = {name for group in result["duplicates"] for name in group["names"][1:]}
+                    # A copy filed in Documents is proof, but is never itself offered for the Trash
+                    self.proven = {name for group in result["duplicates"] for name in group["names"][1:] if name in here}
                     self.proven |= {item["name"] for item in result["extracted"]}
         return result
 
@@ -345,12 +410,30 @@ class App:
             self.proven = set()
             self.planned = None
 
-    def show_file(self, name: object) -> bool:
+    def show_file(self, name: object, batch: object = None) -> bool:
+        if batch is not None:
+            return self._show_moved(batch, name)
         with self.lock:
             path = self.paths.get(name) if isinstance(name, str) else None
         if path is None or not os.path.lexists(path):
             return False
         self.show(path)
+        return True
+
+    def _show_moved(self, batch, name):
+        """Only where the records of that run say the file is now, and only inside the chosen folder."""
+        if type(batch) is not int or batch < 1 or not isinstance(name, str) or not self.actions.able()["tidy"]:
+            return False
+        try:
+            _, files = self.actions.run_files(batch)
+        except ActionError:
+            return False
+        place = next((file.get("place") for file in files if file["name"] == name), None)
+        with self.lock:
+            folder = self.folder
+        if not place or not _within(place, folder) or not os.path.lexists(place):
+            return False
+        self.show(place)
         return True
 
     def recover(self) -> None:
@@ -395,12 +478,11 @@ class App:
                 if self.folder == folder:
                     self.planned = made
             names = list(dict.fromkeys(move.folder for move in moves))
+            with self.lock:
+                proven = set(self.proven) if self.folder == folder else set()
             return {
                 "plan": made.id,
-                "moves": [
-                    {"name": move.file.name, "folder": move.folder, "why": reason(move.file.name, move.why), "bytes": move.file.size}
-                    for move in moves
-                ],
+                "moves": [_move(move, move.file.name in proven) for move in moves],
                 "stays": [_stay(stay) for stay in stays],
                 "folders": [{"name": name, "exists": _is_folder(os.path.join(folder, name))} for name in names],
                 "suggested": suggested,
@@ -449,12 +531,16 @@ class App:
         with self._working():
             return {"batches": self.actions.history() if self.actions.able()["tidy"] else []}
 
-    def undo(self, batch: object) -> dict:
+    def undo(self, batch: object, names: object = None) -> dict:
         with self._working(acting=True):
             self._need("tidy", NO_TIDY)
             if type(batch) is not int or batch < 1:
                 raise ActionError("That run isn't in the history")
-            return self._change(lambda: self.actions.undo(batch))
+            if names is None:
+                return self._change(lambda: self.actions.undo(batch))
+            _, files = self.actions.run_files(batch)
+            wanted = _names(names, {file["name"] for file in files if file["can_put_back"]})
+            return self._change(lambda: self.actions.undo(batch, wanted))
 
     def rules(self) -> dict:
         with self._working():
@@ -473,7 +559,7 @@ class App:
         with self._working() as folder:
             return self._auto(folder)
 
-    def set_auto(self, on: object) -> dict:
+    def set_auto(self, on: object, confirmed: object = None) -> dict:
         with self._working(acting=True) as folder:
             if type(on) is not bool:
                 raise ActionError("Choose on or off")
@@ -482,6 +568,8 @@ class App:
             available, why = self.actions.schedule() if on else (True, "")
             if not available:
                 raise ActionError(why or NO_AUTO)
+            if on and confirmed is not True:
+                raise ActionError(NOT_CONFIRMED)
             self.actions.set_auto(folder, on)
             return self._auto(folder)
 
@@ -503,6 +591,98 @@ class App:
                 self.paths.pop(name, None)
                 self.proven.discard(name)
         return _answer(result)
+
+
+def same_user_here(client: tuple, port: int) -> bool:
+    """On Linux every user can read the link from the browser's command line, so only our own account may use it."""
+    if not sys.platform.startswith("linux"):
+        # Windows hides other users' command lines; macOS doesn't change files, so the window is read-only there
+        return True
+    return peer_uid(client[1], port) == os.getuid()
+
+
+def peer_uid(client_port: int, server_port: int, tables: tuple[str, ...] = ("/proc/net/tcp", "/proc/net/tcp6")) -> int | None:
+    """The account that owns the other end of a connection to this computer, or None if it can't be found."""
+    for table in tables:
+        try:
+            with open(table, encoding="ascii") as rows:
+                next(rows, None)
+                for row in rows:
+                    fields = row.split()
+                    if len(fields) < 8:
+                        continue
+                    local, remote = fields[1].rpartition(":")[2], fields[2].rpartition(":")[2]
+                    if int(local, 16) == client_port and int(remote, 16) == server_port:
+                        return int(fields[7])
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _takes(function, name):
+    try:
+        return name in inspect.signature(function).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _within(path, folder):
+    """Directly or deeper inside the folder, through real folders only."""
+    try:
+        if stat.S_ISLNK(os.lstat(path).st_mode):
+            return False
+        parent, root = os.path.realpath(os.path.dirname(path)), os.path.realpath(folder)
+    except OSError:
+        return False
+    return parent == root or parent.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def _files(store, batch, kind, folder, places=False):
+    """Each file of a run: where it went, where it is now by the records, and whether it can still go back."""
+    waiting = {op.id for op in store.to_undo(batch)} if kind != "undo" else set()
+    files = []
+    for op in store.operations(batch):
+        if op.state != "DONE" or op.action not in ("move", "trash"):
+            continue
+        if kind == "undo":
+            name, to, place, back = os.path.basename(op.dest or op.source), "back", op.dest, False
+        else:
+            back = op.id not in waiting
+            name = os.path.basename(op.source)
+            if op.action == "trash":
+                to = "trash"
+            else:
+                to = _relative(os.path.dirname(op.dest), folder) if op.dest else ""
+            place = op.source if back else op.dest if op.action == "move" else None
+        item = {"name": name, "to": to, "back": back, "can_put_back": not back and kind != "undo" and bool(op.dest)}
+        if places:
+            item["place"] = place
+        files.append(item)
+        if len(files) >= RUN_FILES:
+            break
+    return files
+
+
+def _relative(path, folder):
+    try:
+        return os.path.relpath(path, folder)
+    except ValueError:  # another drive
+        return path
+
+
+def _move(move, proven):
+    warning, why = parts(move.file.name, move.why)
+    found = {"name": move.file.name, "folder": move.folder, "why": why, "bytes": move.file.size}
+    if warning:
+        found["warning"] = warning
+    if proven:
+        found["proven"] = True
+    return found
+
+
+def parts(name: str, why: str) -> tuple[str, str]:
+    warning, _, rest = why.rpartition(". ") if why.startswith("Named like") else ("", "", why)
+    return (f"{warning}." if warning else ""), reason(name, rest)
 
 
 def reason(name: str, why: str) -> str:
@@ -587,6 +767,8 @@ class _Handler(BaseHTTPRequestHandler):
         if body is None:
             return
         if self.path == "/api/session":
+            if not self.app.same_user(self.client_address, self.server.server_address[1]):
+                return self._json(403, {"error": OTHER_USER})
             key = self.app.open_session(body.get("code"))
             return self._json(200, {"key": key, "version": __version__}) if key else self._json(403, {"error": "link expired"})
         if not self.app.allows(self.headers.get("X-Downkeep-Key")):
@@ -607,13 +789,13 @@ class _Handler(BaseHTTPRequestHandler):
             "/api/tidy/plan": lambda: app.plan(),
             "/api/tidy/apply": lambda: app.tidy(body.get("plan"), body.get("names")),
             "/api/history": lambda: app.history(),
-            "/api/undo": lambda: app.undo(body.get("batch")),
+            "/api/undo": lambda: app.undo(body.get("batch"), body.get("names")),
             "/api/rules": lambda: app.rules(),
             "/api/rules/save": lambda: app.save_rules(body.get("rules")),
             "/api/rules/name": lambda: app.name(body.get("rule")),
             "/api/tidy/later": lambda: app.later(),
             "/api/auto": lambda: app.auto(),
-            "/api/auto/set": lambda: app.set_auto(body.get("on")),
+            "/api/auto/set": lambda: app.set_auto(body.get("on"), body.get("confirmed")),
         }.get(self.path)
         if work is None:
             return self._json(404, {"error": "not found"})
@@ -637,7 +819,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _show(self, body):
         try:
-            found = self.app.show_file(body.get("name"))
+            found = self.app.show_file(body.get("name"), body.get("batch"))
         except OSError:
             return self._json(500, {"error": "Your file manager didn't open"})
         self._json(200, {}) if found else self._json(404, {"error": "That file isn't there any more"})

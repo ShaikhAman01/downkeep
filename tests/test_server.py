@@ -3,7 +3,10 @@ import io
 import json
 import os
 import re
+import shutil
 import socket
+import subprocess
+import tempfile
 import threading
 import time
 import unittest
@@ -40,7 +43,7 @@ class ServerTest(FolderTest):
         patch = mock.patch("downkeep.server.BEAT_SECONDS", 0.02)
         patch.start()
         self.addCleanup(patch.stop)
-        self.app = App(str(self.folder), self.shown.append, self.clock, home=self.folder.parent)
+        self.app = App(str(self.folder), self.shown.append, self.clock, home=self.folder.parent, actions=FakeActions(), same_user=lambda client, port: True)
         self.server = make_server(self.app)
         threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
         self.addCleanup(self.server.server_close)
@@ -235,7 +238,7 @@ class ServerTest(FolderTest):
         self.assertEqual(self.call("/api/show", key, {"name": "a.txt"})[0], 404)
 
     def test_two_windows_are_separate(self):
-        other = App(str(self.folder), self.shown.append, self.clock)
+        other = App(str(self.folder), self.shown.append, self.clock, actions=FakeActions())
         second = make_server(other)
         self.addCleanup(second.server_close)
         self.assertNotEqual(second.server_address[1], self.port)
@@ -412,6 +415,164 @@ class ServerTest(FolderTest):
         for path in asked - {"/api/stay", "/api/session"}:
             with self.subTest(path=path):
                 self.assertNotEqual((self.call(path, key)[0], self.call(path, key)[1]), (404, b'{"error": "not found"}'))
+
+
+FAKE_PAGE = """
+const any = new Proxy(function () {}, { get: (t, k) => (k === Symbol.toPrimitive ? () => "" : k === "then" ? undefined : any), apply: () => any });
+function el(tag) {
+  const e = { tagName: tag, attrs: {}, children: [], dataset: {}, handlers: {},
+    setAttribute(n, v) { this.attrs[n] = String(v); }, getAttribute(n) { return this.attrs[n] ?? null; }, contains() { return false; },
+    addEventListener(n, f) { (this.handlers[n] ??= []).push(f); }, append(...c) { this.children.push(...c); }, replaceChildren(...c) { this.children = c; },
+    querySelectorAll() { return []; },
+    get textContent() { return this.children.map((c) => (typeof c === "string" ? c : c.textContent)).join(""); },
+    set textContent(t) { this.children = [String(t)]; } };
+  return new Proxy(e, { get: (t, k) => (k in t ? t[k] : any) });
+}
+const picked = {};
+globalThis.document = new Proxy({ createElement: el, createElementNS: (ns, tag) => el(tag), querySelector: (s) => (picked[s] ??= el("div")), documentElement: el("html") },
+  { get: (t, k) => (k in t ? t[k] : any) });
+globalThis.matchMedia = () => ({ matches: false, addEventListener() {} });
+globalThis.SVGElement = class {};
+globalThis.addEventListener = () => {};
+const asked = [];
+const answers = {};
+globalThis.fetch = async (path, { body }) => {
+  asked.push([path, JSON.parse(body)]);
+  return { ok: true, status: 200, json: async () => answers[path] ?? {} };
+};
+const press = async (node) => { for (const f of node.handlers.click ?? []) f({ detail: 0, currentTarget: node }); await new Promise((r) => setTimeout(r, 50)); };
+const page = process.argv[2];
+const core = await import(new URL(`file://${page}/core.js`));
+const clutter = await import(new URL(`file://${page}/clutter.js`));
+const auto = await import(new URL(`file://${page}/auto.js`));
+const panel = document.querySelector("#stage");
+const find = (node, test, out = []) => {
+  if (typeof node !== "string") { if (test(node)) out.push(node); (node.children ?? []).forEach((child) => find(child, test, out)); }
+  return out;
+};
+const result = await (async () => { %s })();
+console.log(JSON.stringify(result));
+"""
+
+
+@unittest.skipUnless(shutil.which("node"), "needs Node.js")
+class PageTest(unittest.TestCase):
+    def run_page(self, body):
+        with tempfile.TemporaryDirectory() as folder:
+            script = os.path.join(folder, "run.mjs")
+            with open(script, "w", encoding="utf-8") as file:
+                file.write(FAKE_PAGE % body)
+            page = str(files("downkeep").joinpath("page"))
+            done = subprocess.run(["node", script, page], capture_output=True, text=True, timeout=60, cwd=folder)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return json.loads(done.stdout.strip().splitlines()[-1])
+
+    def test_copy_picture_shows_whole_names_and_where_each_one_is(self):
+        texts = self.run_page("""
+          const lines = (item) => find(core.copyPicture(item, "Downloads"), (node) => node.tagName === "text").map((node) => node.textContent);
+          return [
+            lines({ name: "Resume_Aman.pdf", keep: "Documents/Resume_Aman.pdf" }),
+            lines({ name: "Resume (1).pdf", keep: "Resume.pdf" }),
+            lines({ name: "a.pdf", keep: "Work\\\\a.pdf" }),
+          ];
+        """)
+        self.assertEqual(texts, [
+            ["Resume_Aman.pdf", "in Downloads", "the copy", "Resume_Aman.pdf", "in Documents", "the one that stays"],
+            ["Resume (1).pdf", "in Downloads", "the copy", "Resume.pdf", "in Downloads", "the one that stays"],
+            ["a.pdf", "in Downloads", "the copy", "a.pdf", "in Work", "the one that stays"],
+        ])
+
+    def test_long_names_wrap_without_losing_a_character(self):
+        name = "Quarterly_Report_Final_v3 signed-by-everyone(scan 2).pdf"
+        lines = self.run_page("""
+          const width = (text) => [...text].length * 10;
+          return [%s, "\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9.pdf", "a"].map((name) => core.wrap(name, 100, width));
+        """ % json.dumps(name))
+        self.assertEqual(["".join(found) for found in lines], [name, "é" * 12 + ".pdf", "a"])
+        for found in lines:
+            self.assertTrue(all(0 < len(line) <= 10 for line in found), found)
+            self.assertFalse(any("…" in line for line in found))
+        self.assertIn("Quarterly_", lines[0])
+        self.assertTrue(any(line.startswith("(scan") for line in lines[0]), lines[0])
+
+    def test_copy_text_names_the_one_that_stays(self):
+        said = self.run_page("""
+          return [clutter.copyWhy({ name: "Resume (1).pdf", keep: "Resume.pdf" }), clutter.copyWhy({ name: "a.pdf", keep: "Documents/a.pdf" })];
+        """)
+        self.assertEqual(said, [
+            "Same as Resume.pdf, which stays. Same contents, checked from start to end.",
+            "Same as Documents/a.pdf, which stays. Same contents, checked from start to end.",
+        ])
+
+    def test_the_file_that_stays_is_marked_in_the_list(self):
+        rows = self.run_page("""
+          core.state.system = { trash: true, restore: true, tidy: true };
+          core.state.report = { folder: "/x/Downloads", files: 3, bytes: 300, extracted: [], skipped: {}, ages: [], types: [],
+            sites: { known: [], unknown: { files: 0 } }, duplicates: [{ names: ["Resume.pdf", "Resume (1).pdf"], bytes_each: 100 }],
+            biggest: [{ name: "Resume.pdf", bytes: 100 }, { name: "Resume (1).pdf", bytes: 100 }, { name: "a.txt", bytes: 100 }] };
+          clutter.showClutter();
+          return find(core.list, (node) => node.attrs?.class === "item").map((row) => [
+            row.textContent, find(row, (node) => node.attrs?.class === "stays").map((tag) => [tag.tagName, tag.textContent])]);
+        """)
+        self.assertIn(["Resume.pdfstays100 B", [["small", "stays"]]], rows)
+        self.assertIn(["Resume (1).pdf100 B", []], rows)
+        self.assertIn(["a.txt100 B", []], rows)
+
+    def test_automatic_intro_follows_the_state(self):
+        said = self.run_page("""
+          return [
+            auto.intro({ on: false }), auto.intro({ on: true, folder: "/x/Downloads" }, false), auto.intro({ on: true, folder: "/x/Other" }, true),
+            auto.every([{ days: 1 }]), auto.every([{ days: 0 }]), auto.every([{ days: 1 }, { days: 3 }], "as set for each folder"),
+          ];
+        """)
+        self.assertEqual(said, [
+            "Off until you turn it on. It only moves files that arrive after that, using the same folders you approved.",
+            "On. It only moves files that arrived after you turned it on, using the folders you approved.",
+            "On for Other. It only moves files that arrived there after it was turned on.",
+            "Every hour, new files older than 1 day move to their folder, even when Downkeep is closed.",
+            "Every hour, new files move to their folder, even when Downkeep is closed.",
+            "Every hour, new files old enough, as set for each folder, move to their folder, even when Downkeep is closed.",
+        ])
+
+    AUTO = """
+      core.state.report = { folder: "/x/Downloads", files: 4 };
+      Object.assign(answers, {
+        "/api/auto": { available: true, on: %s, folder: "/x/Downloads", waiting: 0, note: "" },
+        "/api/rules": { rules: [{ id: "documents", folder: "Documents", on: true, auto: true, days: 1 },
+                                { id: "images", folder: "Images", on: true, auto: true, days: 1 },
+                                { id: "music", folder: "Music", on: false, auto: true, days: 1 }] },
+        "/api/history": { batches: [{ kind: "tidy", batch: 1, when: 1, files: [] }] },
+      });
+      await auto.showAuto();
+      const master = find(panel, (node) => node.attrs?.role === "switch" && node.attrs["aria-label"] === "Automatic tidying")[0];
+      const said = () => find(panel, (node) => node.tagName === "p" || node.tagName === "h2").map((node) => node.textContent).join(" | ");
+      const first = said();
+      asked.length = 0;
+      await press(master);
+    """
+
+    def test_switching_on_asks_first_and_only_turn_on_tells_the_server(self):
+        seen = self.run_page(self.AUTO % "false" + """
+          const before = asked.map((call) => call[0]);
+          const asking = said();
+          const buttons = find(panel, (node) => node.tagName === "button" && /main-act|next/.test(node.attrs.class));
+          await press(buttons.find((node) => node.textContent === "Turn on"));
+          return { first, before, asking, buttons: buttons.map((node) => node.textContent), after: asked.filter((call) => call[0] === "/api/auto/set") };
+        """)
+        self.assertIn("Off until you turn it on.", seen["first"])
+        self.assertEqual(seen["before"], [])
+        for text in ["Turn on automatic tidying?", "Every hour, new files older than 1 day move to their folder, even when Downkeep is closed.",
+                     "These folders take new files:", "new files, after 1 day, to Downloads", "Nothing would move right now.",
+                     "The 4 files here now stay where they are."]:
+            self.assertIn(text, seen["asking"])
+        self.assertNotIn("Music", seen["asking"])
+        self.assertEqual(seen["buttons"], ["Turn on", "Cancel"])
+        self.assertEqual(seen["after"], [["/api/auto/set", {"on": True, "confirmed": True}]])
+
+    def test_switching_off_is_one_click(self):
+        seen = self.run_page(self.AUTO % "true" + "return { first, after: asked.filter((call) => call[0] === '/api/auto/set') };")
+        self.assertIn("On. It only moves files that arrived after you turned it on", seen["first"])
+        self.assertEqual(seen["after"], [["/api/auto/set", {"on": False}]])
 
 
 class WindowTest(unittest.TestCase):

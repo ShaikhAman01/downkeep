@@ -1,4 +1,7 @@
+import os
+import stat
 import struct
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -153,6 +156,73 @@ class TellTest(unittest.TestCase):
         ):
             window._message("hello")
         start.assert_not_called()
+
+
+class PrivateFilesTest(unittest.TestCase):
+    def setUp(self):
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        self.base = Path(holder.name)
+
+    @unittest.skipUnless(os.name == "posix", "modes are POSIX")
+    def test_log_is_private(self):
+        place = self.base / "state" / "downkeep" / "log.txt"
+        with mock.patch("downkeep.window._log_file", return_value=place), mock.patch("os.umask", return_value=0):
+            window.log("one")
+        self.assertEqual(stat.S_IMODE(place.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(place.parent.stat().st_mode), 0o700)
+        place.chmod(0o644)
+        with mock.patch("downkeep.window._log_file", return_value=place):
+            window.log("two")
+        self.assertEqual(stat.S_IMODE(place.stat().st_mode), 0o600)
+        self.assertEqual(len(place.read_text(encoding="utf-8").splitlines()), 2)
+
+    @unittest.skipUnless(os.name == "posix", "links")
+    def test_log_never_follows_a_link(self):
+        target = self.base / "target"
+        target.write_text("mine")
+        (self.base / "downkeep").mkdir()
+        (self.base / "downkeep" / "log.txt").symlink_to(target)
+        with mock.patch("downkeep.window._log_file", return_value=self.base / "downkeep" / "log.txt"):
+            window.log("one")
+        self.assertEqual(target.read_text(), "mine")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "the Linux place")
+    def test_a_relative_state_folder_is_ignored(self):
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": "relative/state"}), mock.patch("pathlib.Path.home", return_value=self.base):
+            self.assertEqual(window._log_file(), self.base / ".local" / "state" / "downkeep" / "log.txt")
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.base / "s")}):
+            self.assertEqual(window._log_file(), self.base / "s" / "downkeep" / "log.txt")
+
+    def test_link_file_refuses_what_is_there(self):
+        (self.base / "there").write_text("x")
+        (self.base / "folder").mkdir()
+        for name in ["there", "folder"]:
+            with self.subTest(name=name), self.assertRaises(FileExistsError):
+                window.write_link(str(self.base / name), "http://x")
+        self.assertEqual((self.base / "there").read_text(), "x")
+
+    def test_link_file_refuses_links_even_without_nofollow(self):
+        try:
+            (self.base / "dangling").symlink_to(self.base / "elsewhere")
+            (self.base / "linked").symlink_to(self.base / "real", target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("links are not allowed here")
+        (self.base / "real").mkdir()
+        with mock.patch("os.O_NOFOLLOW", 0, create=True):
+            for place in [self.base / "dangling", self.base / "linked" / "link.txt"]:
+                with self.subTest(place=place), self.assertRaises(FileExistsError):
+                    window.write_link(str(place), "http://x")
+        self.assertFalse((self.base / "elsewhere").exists())
+        self.assertEqual(list((self.base / "real").iterdir()), [])
+
+    def test_link_file_that_lands_elsewhere_is_removed(self):
+        place = self.base / "link"
+        real = os.path.realpath
+        with mock.patch("os.path.realpath", lambda path: real(path) + ("x" if str(path) == str(place) else "")):
+            with self.assertRaises(FileExistsError):
+                window.write_link(str(place), "http://x")
+        self.assertFalse(place.exists())
 
 
 class IconTest(unittest.TestCase):

@@ -1,6 +1,6 @@
 import { ask, sample, useKey } from "./ask.js";
 import { showAuto } from "./auto.js";
-import { proof, showClutter, showRecovered } from "./clutter.js";
+import { allClear, proof, showClutter, showRecovered } from "./clutter.js";
 import {
   again, app, bar, baseName, bdi, button, closed, ended, expired, folderIcon, go, h, human, list, main, message, panel, plural,
   small, stage, state, sum, tabs, toast, total, visit,
@@ -10,6 +10,7 @@ import { forgetPlan, showTidy } from "./tidy.js";
 
 const SCREENS = { clutter: () => showClutter(), tidy: showTidy, auto: showAuto };
 const TABS = [...tabs.children];
+const tagline = document.querySelector("#tagline");
 let fresh = null;
 
 go.lists = lists;
@@ -62,6 +63,7 @@ go.refresh = () => {
     if (fresh !== turn) return;
     state.report = report;
     state.checked = now();
+    checkedAt = Date.now();
     if (report) {
       drawSum();
       if (state.tab === "clutter") showClutter(true);
@@ -71,6 +73,34 @@ go.refresh = () => {
   });
   fresh = turn;
 };
+
+let checkedAt = 0;
+let looking = false;
+const STALE_MS = 60_000;
+const shape = (report) => JSON.stringify([report.files, report.bytes, report.duplicates, report.extracted]);
+
+/** Back in the window after a while: checks quietly, and only says so if something changed. */
+async function freshen() {
+  if (sample || looking || fresh || state.acting || !state.report || app.classList.contains("plain")) return;
+  if (document.visibilityState !== "visible" || Date.now() - checkedAt < STALE_MS) return;
+  looking = true;
+  let report;
+  try {
+    report = await ask("/api/report");
+  } catch {
+    return;
+  } finally {
+    looking = false;
+    checkedAt = Date.now();
+  }
+  if (fresh || state.acting || shape(report) === shape(state.report)) return;
+  const arrived = report.files > state.report.files;
+  state.report = report;
+  forgetPlan();
+  drawSum();
+  sum.append(h("p", { class: "fresh", role: "status" }, arrived ? "New files arrived: " : "This folder changed: ",
+    button("text inline", "Check again", check)));
+}
 
 const now = () => new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
 
@@ -83,7 +113,8 @@ function drawSum() {
   parts.children[1].style.flexGrow = Math.max(0, report.bytes - bytes);
   sum.replaceChildren(...(proven.length
     ? [h("h1", { tabindex: "-1" }, `${human(bytes)} can go`), parts, h("p", {}, `Proven, out of ${human(report.bytes)} in ${plural(report.files, "file")}`)]
-    : [h("h1", { tabindex: "-1" }, report.files ? "Nothing proven" : "No files to check"), ...(report.files ? [h("p", {}, `${human(report.bytes)} in ${plural(report.files, "file")}`)] : [])]));
+    : [h("h1", { tabindex: "-1" }, allClear(report) ? "All clear: no proven clutter" : report.files ? "Nothing proven" : "No files to check"), ...(report.files ? [h("p", {}, `${human(report.bytes)} in ${plural(report.files, "file")}`)] : [])]));
+  tagline.hidden = state.history.length > 0;
   if (!sample) {
     sum.append(h("div", { class: "where" }, bdi(baseName(report.folder)),
       button("link", "Change folder", () => pickFolder(() => go.tab(state.tab)))));
@@ -111,6 +142,7 @@ async function check() {
   }
   state.report = report;
   state.checked = now();
+  checkedAt = Date.now();
   app.classList.remove("plain");
   tabs.hidden = Boolean(sample) && !state.system.tidy && !state.system.trash;
   drawSum();
@@ -240,4 +272,6 @@ tabs.addEventListener("keydown", (event) => {
   TABS[(to + TABS.length) % TABS.length].focus();
 });
 again.addEventListener("click", check);
+addEventListener("focus", freshen);
+document.addEventListener("visibilitychange", freshen);
 start();

@@ -87,6 +87,14 @@ export function icon(kind) {
     v("path", { d: "M12 1l6 6h-5a1 1 0 0 1-1-1z", class: "fold" }));
 }
 
+export const trashIcon = () => v("svg", { width: 22, height: 20, viewBox: "0 0 22 20", "aria-hidden": "true", class: "bin" },
+  v("path", { d: "M8 2.5h6M3.500 5h15", class: "bin-line" }),
+  v("path", { d: "M5 7h12l-1 10.500a1.500 1.500 0 0 1-1.500 1.300h-7a1.500 1.500 0 0 1-1.500-1.300z", class: "bin-body" }));
+
+export const historyIcon = () => v("svg", { width: 20, height: 22, viewBox: "0 0 20 22", "aria-hidden": "true", class: "k-dots" },
+  v("circle", { cx: 10, cy: 11, r: 7.5, class: "clock" }),
+  v("path", { d: "M10 7v4.500l3 2", class: "clock" }));
+
 export const folderIcon = () => v("svg", { width: 22, height: 20, viewBox: "0 0 22 20", "aria-hidden": "true" },
   v("path", { d: "M2 4a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v2H2z", class: "back" }),
   v("path", { d: "M1 8.500a1.500 1.500 0 0 1 1.500-1.500h17a1.500 1.500 0 0 1 1.500 1.600l-.8 8a2 2 0 0 1-2 1.900H3.800a2 2 0 0 1-2-1.900z", class: "front" }));
@@ -144,16 +152,86 @@ export function zipPicture(item, where) {
 
 export const lone = (text, note) => picture(text, v("g", { transform: "translate(-160 0)" }, ...folder(text, note, [])));
 
-export function copyPicture(item) {
-  return picture(`${item.name} has the same contents as ${item.keep}`,
-    sheet(40, item.name, "the copy"),
-    sheet(330, item.keep, "the one that stays"),
+const paper = (x, bottom) => `M${x + 10} 30h150l30 30v${bottom - 70}a10 10 0 0 1-10 10h-170a10 10 0 0 1-10-10v-${bottom - 50}a10 10 0 0 1 10-10z`;
+
+/** A file name split over lines, never shortened. Breaks after a space, _ or -, or before (, when one is near. */
+export function wrap(text, width, measure) {
+  const left = [...text];
+  const lines = [];
+  while (left.length) {
+    let count = 1;
+    while (count < left.length && measure(left.slice(0, count + 1).join("")) <= width) count += 1;
+    if (count < left.length) {
+      const cut = left.slice(0, count).findLastIndex((char, at) => /[\s_\-]/.test(char) || left[at + 1] === "(");
+      if (cut >= count * 0.4) count = cut + 1;
+    }
+    lines.push(left.splice(0, count).join(""));
+  }
+  return lines;
+}
+
+/** `place` is the folder the file is in, on a line of its own. */
+function card(x, name, place, note) {
+  const kind = kindOf(name);
+  const line = (text, style) => v("text", { x: x + 18, class: style, "data-wrap": 154 }, clean(text));
+  return v("g", { class: "rise", "data-card": x },
+    v("path", { d: paper(x, 270), class: "paper" }),
+    v("path", { d: `M${x + 160} 30l30 30h-22a8 8 0 0 1-8-8z`, class: `k-${kind}`, "fill-opacity": 0.55 }),
+    v("rect", { x: x + 18, y: 56, width: 40, height: 8, rx: 4, class: `k-${kind}` }),
+    ...[154, 132, 145, 92].map((width, row) => v("rect", { x: x + 18, y: 82 + row * 16, width, height: 6, rx: 3, class: "rule" })),
+    line(name, "ink"),
+    line(place, "minor ink-soft"),
+    line(note, "minor ink-soft"));
+}
+
+export function keeper(keep, home) {
+  const cut = Math.max(keep.lastIndexOf("/"), keep.lastIndexOf("\\"));
+  return cut < 0 ? { name: keep, folder: home } : { name: keep.slice(cut + 1), folder: keep.slice(0, cut) };
+}
+
+export function copyPicture(item, home) {
+  const kept = keeper(item.keep, home);
+  return picture(`${item.name} has the same contents as ${kept.name} in ${kept.folder}`,
+    card(40, item.name, `in ${home}`, "the copy"),
+    card(330, kept.name, `in ${kept.folder}`, "the one that stays"),
     v("path", { d: "M234 150h14M312 150h14", class: "link-dots" }),
     tick(280, 150));
 }
 
+/** Lays out the lines of each card from the top of its text, and makes every card tall enough for the longest. */
+function stack(root) {
+  const cards = [...root.querySelectorAll("[data-card]")];
+  if (!cards.length) return;
+  const laid = cards.map((group) => {
+    const texts = [...group.querySelectorAll("text")];
+    const parts = texts.map((text) => {
+      const size = parseFloat(getComputedStyle(text).fontSize) || 15;
+      const lines = wrap(text.textContent, Number(text.dataset.wrap), (part) => { text.textContent = part; return text.getComputedTextLength(); });
+      return { text, lines, height: size * 1.3 };
+    });
+    return { group, parts, need: parts.reduce((sum, part) => sum + part.lines.length * part.height, 0) };
+  });
+  const most = Math.max(...laid.map((one) => one.need));
+  const top = Math.max(76, 262 - most);
+  const bottom = Math.max(270, top + most + 10);
+  for (const { group, parts } of laid) {
+    const x = Number(group.dataset.card);
+    let y = top;
+    for (const { text, lines, height } of parts) {
+      text.replaceChildren(...lines.map((part) => {
+        y += height;
+        return v("tspan", { x: x + 18, y: y - height * 0.3 }, part);
+      }));
+    }
+    group.querySelector(".paper").setAttribute("d", paper(x, bottom));
+    group.querySelectorAll(".rule").forEach((rule) => { rule.style.display = Number(rule.getAttribute("y")) + 10 > top ? "none" : ""; });
+  }
+  if (bottom > 270) root.querySelector("svg")?.setAttribute("viewBox", `0 0 560 ${bottom + 50}`);
+}
+
 function fit(root) {
-  for (const text of root.querySelectorAll("text")) {
+  stack(root);
+  for (const text of root.querySelectorAll("text[data-width]")) {
     const full = [...text.textContent];
     const width = Number(text.dataset.width);
     const tail = full.slice(-6);
@@ -326,7 +404,11 @@ const moreButton = (drawn, count, draw, extra = "") => [
 ];
 
 /** Rows with ticks. `off` holds the names that are not ticked, also for rows that are not drawn yet. */
-export function ticks(rows, off, { name, note, changed, title }) {
+export const warnIcon = () => v("svg", { width: 18, height: 18, viewBox: "0 0 18 18", "aria-hidden": "true", class: "warn-icon" },
+  v("path", { d: "M9 1.500 17 16H1z", class: "warn-shape" }),
+  v("path", { d: "M9 6.500v4.200M9 13.300v.1", class: "warn-mark" }));
+
+export function ticks(rows, off, { name, note, changed, title, warn = () => "" }) {
   const items = h("ul", { class: "ticks" });
   const more = h("p", { class: "more-rows" });
   const boxes = [];
@@ -346,7 +428,9 @@ export function ticks(rows, off, { name, note, changed, title }) {
     });
     update();
     boxes.push(update);
-    return h("li", {}, h("label", {}, box, icon(kindOf(name(item))), bdi(name(item)), text));
+    const warning = warn(item);
+    return h("li", {}, h("label", {}, box, icon(kindOf(name(item))), bdi(name(item)), text,
+      warning ? h("span", { class: "warn" }, warnIcon(), clean(warning)) : null));
   }
 
   function draw() {
@@ -377,8 +461,9 @@ export function switchButton(on, name, change) {
   }, h("i", { "aria-hidden": "true" }));
 }
 
-export function entry(art, text, value, onclick) {
-  return h("button", { class: "item", type: "button", title: clean(text), "aria-current": "false", onclick }, art, bdi(text), h("span", {}, value));
+export function entry(art, text, value, onclick, stays = false) {
+  const name = stays ? h("b", { class: "named" }, bdi(text), h("small", { class: "stays" }, "stays")) : bdi(text);
+  return h("button", { class: "item", type: "button", title: clean(text), "aria-current": "false", onclick }, art, name, h("span", {}, value));
 }
 
 export const mark = (current) => list.querySelectorAll(".item").forEach((item) => item.setAttribute("aria-current", String(item === current)));

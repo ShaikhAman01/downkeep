@@ -19,7 +19,7 @@ from downkeep.window import log, open_window, show_in_folder, write_link
 
 LINK_FILE = "DOWNKEEP_LINK_FILE"
 ROWS = 20
-KINDS = {"tidy": "Tidied", "auto": "Tidied automatically", "trash": "Moved to the Trash", "undo": "Undid a run"}
+KINDS = {"tidy": "Tidied", "auto": "Tidied automatically", "trash": "Moved to the Recycle Bin" if sys.platform == "win32" else "Moved to the Trash", "undo": "Undid a run"}
 
 
 def main(argv: list[str] | None = None) -> int:

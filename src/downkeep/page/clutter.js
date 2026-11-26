@@ -1,8 +1,13 @@
 import { sample, ask } from "./ask.js";
 import {
   act, acts, baseName, bdi, bin, button, capital, clean, copyPicture, ended, entry, facts, go, h, human, icon, kindOf, list,
-  lone, main, mark, picture, plural, restage, sheet, small, stage, state, ticks, toast, total, visit, zipPicture,
+  historyIcon, lone, main, mark, picture, plural, restage, sheet, small, stage, state, ticks, toast, total, visit, zipPicture,
 } from "./core.js";
+import { showHistory } from "./runs.js";
+
+/** After something was moved to the Trash and nothing proven is left. */
+export const allClear = (report) => !proof(report).proven.length && report.files > 0
+  && state.history.some((run) => run.kind === "trash" && !run.undone);
 
 const SHOWN = 500;
 const off = new Set();
@@ -15,14 +20,19 @@ function days(count) {
   return `Last changed ${Math.floor(count / 365)} years ago`;
 }
 
+// A copy filed in a folder like Documents/Resume.pdf is proof, never clutter itself
+const here = (name) => !/[\\/]/.test(name);
+
 export function proof(report) {
   const zips = report.extracted.map((item) => ({ ...item, zip: true }));
   const zipNames = new Set(zips.map((item) => item.name));
   const copies = report.duplicates
-    .flatMap((group) => group.names.slice(1).map((name) => ({ name, keep: group.names[0], bytes: group.bytes_each })))
+    .flatMap((group) => group.names.slice(1).filter(here).map((name) => ({ name, keep: group.names[0], bytes: group.bytes_each })))
     .filter((item) => !zipNames.has(item.name));
   return { zips, copies, proven: [...zips, ...copies] };
 }
+
+export const copyWhy = (item) => `Same as ${clean(item.keep)}, which stays. Same contents, checked from start to end.`;
 
 function footnote() {
   if (sample && !state.system?.trash) return "This is made-up data. Nothing on your computer was read.";
@@ -97,8 +107,8 @@ export function showClutter(quiet = false) {
         what: [bdi(item.name), `, ${human(item.bytes)}`],
         why: item.zip
           ? `${item.files === 1 ? "It" : "Each"} was found with the same name, size and checksum.`
-          : item.keep ? "Same contents, checked from start to end." : kept.has(item.name) ? "Its identical copies are listed above." : `${days(item.days_old)}. Old or big is not proof of clutter.`,
-        art: item.zip ? zipPicture(item, where) : item.keep ? copyPicture(item) : picture(item.name, sheet(185, item.name, "left alone")),
+          : item.keep ? copyWhy(item) : kept.has(item.name) ? "Its identical copies are in the list." : `${days(item.days_old)}. Old or big is not proof of clutter.`,
+        art: item.zip ? zipPicture(item, where) : item.keep ? copyPicture(item, home) : picture(item.name, sheet(185, item.name, "left alone")),
         buttons: [
           movable ? button("main-act", `Move to ${bin()}`, () => confirmOne(item), { "aria-label": `Move ${clean(item.name)} to the ${bin()}` }) : null,
           showIn(item.name, movable ? "next" : "main-act"),
@@ -118,7 +128,7 @@ export function showClutter(quiet = false) {
       say: `Move this file to the ${bin()}?`,
       what: [bdi(item.name), `, ${human(item.bytes)}, `, bdi(why(item, home))],
       why: `The proof is checked again just before it moves. ${back("it")}`,
-      art: item.zip ? zipPicture(item, where) : copyPicture(item),
+      art: item.zip ? zipPicture(item, where) : copyPicture(item, home),
       buttons: [
         button("main-act", `Yes, move to ${bin()}`, () => trash([item], () => confirmOne(item))),
         button("next", "Cancel", () => { open(item); acts.querySelector("button").focus(); }),
@@ -190,7 +200,7 @@ export function showClutter(quiet = false) {
   }
 
   function row(item, kind, text, value) {
-    const made = entry(icon(kind), text, value, () => open(item, true));
+    const made = entry(icon(kind), text, value, () => open(item, true), kept.has(item.name));
     buttons.set(item, made);
     return h("li", {}, made);
   }
@@ -212,7 +222,8 @@ export function showClutter(quiet = false) {
     ...(copies.length ? group("Exact copies", human(total(copies, "bytes")), copies) : []),
     ...(report.files ? group("Left alone", human(Math.max(0, report.bytes - total(proven, "bytes"))), others) : []),
     rest > others.length ? h("p", { class: "none" }, `And ${plural(rest - others.length, "more file")}.`) : null,
-    h("ul", {}, row({ more: true }, "dots", "More about this folder", "")),
+    h("ul", {}, row({ more: true }, "dots", "More about this folder", ""),
+      state.system?.tidy ? h("li", {}, entry(historyIcon(), "History", "", () => showHistory("clutter"))) : null),
   ].filter(Boolean));
 
   function first(focus = false) {
@@ -222,7 +233,9 @@ export function showClutter(quiet = false) {
       visit();
       mark(null);
       stage(report.files
-        ? { say: "Nothing here is proven clutter", why: "There are no exact copies, and no zip whose every file was found. So everything stays.", art: lone(home, plural(report.files, "file")), note: footnote() }
+        ? allClear(report)
+          ? { say: "All clear: no proven clutter", why: "Everything left here is either one of a kind or has no proof. Tidy can still sort it into folders.", art: lone(home, plural(report.files, "file")), note: footnote() }
+          : { say: "Nothing here is proven clutter", why: "There are no exact copies, and no zip whose every file was found. So everything stays.", art: lone(home, plural(report.files, "file")), note: footnote() }
         : { say: "There are no finished files here", why: "Hidden, empty and unfinished files are not counted.", art: lone(home, "nothing to check"), note: footnote() });
     }
     if (focus) go.focus();

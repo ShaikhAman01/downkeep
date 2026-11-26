@@ -1,7 +1,7 @@
 import { ask } from "./ask.js";
 import { baseName, bdi, button, clean, ended, go, h, list, loading, plural, sentence, stage, state, switchButton, trouble, visit } from "./core.js";
 import { loadRules } from "./rules.js";
-import { listRuns, loadHistory, showHistory, undo } from "./runs.js";
+import { listRuns, loadHistory, place, showHistory, undo } from "./runs.js";
 
 const DAYS = [0, 1, 2, 3, 7, 14, 30];
 const after = (days) => (days === 0 ? "right away" : `after ${plural(days, "day")}`);
@@ -49,9 +49,9 @@ function draw(status, rules, focus) {
   const elsewhere = status.on && status.folder && status.folder !== state.report.folder;
 
   async function master(on, control) {
-    if (on && !state.history.some((run) => run.kind === "tidy")) return preview(shown);
+    if (on) return preview(shown);
     control.disabled = true;
-    await set(on, problem, control);
+    await set(false, problem, control);
   }
 
   async function change(rule, changes, control, undoChange) {
@@ -87,7 +87,7 @@ function draw(status, rules, focus) {
       control.setAttribute("aria-checked", String(on));
       change(rule, { auto: on }, control, () => control.setAttribute("aria-checked", String(!on)));
     });
-    return h("li", {}, h("div", {}, h("b", {}, bdi(rule.folder)), h("p", { class: "soft" }, "to ", bdi(rule.folder), ", ", choice)), control);
+    return h("li", {}, h("div", {}, h("b", {}, bdi(rule.folder)), h("p", { class: "soft" }, "to ", bdi(place(baseName(state.report.folder), rule.folder)), ", ", choice)), control);
   }
 
   idle();
@@ -96,7 +96,7 @@ function draw(status, rules, focus) {
   stage({
     say: "Tidy new files for me",
     what: status.note ? clean(status.note) : null,
-    why: "Off until you turn it on. It only moves files that arrive after that, using the same folders you approved.",
+    why: intro(status, elsewhere),
     art: h("div", { class: "hold autos" },
       h("ul", {},
         h("li", { class: "master" },
@@ -105,8 +105,7 @@ function draw(status, rules, focus) {
         ...usable.map(row)),
       problem),
     buttons: [
-      elsewhere ? button("main-act", "Use this folder instead", () => set(true, problem)) : null,
-      status.on && !elsewhere ? button("next", "Pause all", (event) => { event.currentTarget.disabled = true; set(false, problem, event.currentTarget); }) : null,
+      elsewhere ? button("main-act", "Use this folder instead", () => preview(shown)) : null,
       last ? button("next", "Undo last run", () => undo(last.batch, "auto")) : null,
       button("next", "History", () => showHistory("auto")),
     ].filter(Boolean),
@@ -115,28 +114,46 @@ function draw(status, rules, focus) {
   });
 }
 
+export function intro(status, elsewhere) {
+  if (!status.on) return "Off until you turn it on. It only moves files that arrive after that, using the same folders you approved.";
+  if (elsewhere) return `On for ${baseName(status.folder)}. It only moves files that arrived there after it was turned on.`;
+  return "On. It only moves files that arrived after you turned it on, using the folders you approved.";
+}
+
+export function every(used, which = "as set below") {
+  const days = [...new Set(used.map((rule) => rule.days))];
+  const age = days.length === 1 ? (days[0] ? `older than ${plural(days[0], "day")} ` : "") : `old enough, ${which}, `;
+  return `Every hour, new files ${age}move to their folder, even when Downkeep is closed.`;
+}
+
 function state_(status, rules, elsewhere) {
   if (!status.on) return "Off. Nothing moves by itself.";
   if (elsewhere) return `On for ${baseName(status.folder)}, not for this folder.`;
-  if (!rules.some((rule) => rule.on && rule.auto)) return "On, but no folder below is switched on, so nothing will move.";
-  const waiting = status.waiting ? `${plural(status.waiting, "file")} waiting` : "nothing waiting";
+  const used = rules.filter((rule) => rule.on && rule.auto);
+  if (!used.length) return "On, but no folder below is switched on, so nothing will move.";
+  const waiting = status.waiting ? ` ${plural(status.waiting, "file")} waiting now.` : "";
   const problem = status.available ? "" : ` ${sentence(status.why)}`;
-  return `On, ${waiting}.${status.next ? ` Next check ${clean(status.next)}.` : ""}${problem}`;
+  return `On. ${every(used)}${waiting}${problem}`;
 }
 
-function preview(rules) {
+/** Nothing here now ever moves by itself: turning it on counts every file already in the folder as staying. */
+export function preview(rules) {
   visit();
   const used = rules.filter((rule) => rule.on && rule.auto);
   const problem = h("p", { class: "problem", role: "alert" });
+  const files = state.report?.files ?? 0;
   stage({
     say: "Turn on automatic tidying?",
-    why: used.length
-      ? "You haven't used Tidy yet, so here is where new files would go. Files that are here now stay where they are."
-      : "No folder is switched on for it yet. Switch at least one on first.",
-    art: h("div", { class: "hold autos" }, h("ul", {}, ...used.map((rule) =>
-      h("li", {}, h("div", {}, h("b", {}, bdi(rule.folder)), h("p", { class: "soft" }, "new files, ", after(rule.days)))))), problem),
+    why: used.length ? every(used, "as set for each folder") : "No folder is switched on for it yet. Switch at least one on first.",
+    art: h("div", { class: "hold autos" },
+      used.length ? h("p", { class: "now" }, h("b", {}, "Nothing would move right now. "),
+        files ? `The ${plural(files, "file")} here now stay where they are. Only files that arrive after you turn it on can move.` : "Only files that arrive after you turn it on can move.") : null,
+      used.length ? h("p", { class: "soft" }, `${used.length === 1 ? "This folder takes" : "These folders take"} new files:`) : null,
+      h("ul", {}, ...used.map((rule) =>
+        h("li", {}, h("div", {}, h("b", {}, bdi(rule.folder)), h("p", { class: "soft" }, "new files, ", after(rule.days), ", to ", bdi(place(baseName(state.report.folder), rule.folder))))))),
+      problem),
     buttons: [
-      used.length ? button("main-act", "Turn it on", (event) => { event.currentTarget.disabled = true; set(true, problem, event.currentTarget); }) : null,
+      used.length ? button("main-act", "Turn on", (event) => { event.currentTarget.disabled = true; set(true, problem, event.currentTarget); }) : null,
       button("next", "Cancel", () => go.tab("auto")),
     ].filter(Boolean),
     note: NEVER,
@@ -147,7 +164,7 @@ function preview(rules) {
 async function set(on, problem, control) {
   problem.textContent = "";
   try {
-    await ask("/api/auto/set", { on });
+    await ask("/api/auto/set", on ? { on, confirmed: true } : { on });
   } catch (error) {
     if (ended(error)) return;
     if (control) control.disabled = false;

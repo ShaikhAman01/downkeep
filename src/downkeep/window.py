@@ -1,3 +1,4 @@
+import errno
 import os
 import shutil
 import subprocess
@@ -43,9 +44,26 @@ def show_in_folder(path: str) -> None:
 
 def write_link(place: str, url: str) -> None:
     """For testing the packaged app: the link goes to a new private file instead of a browser."""
+    path = Path(os.path.abspath(place))
+    # Windows has no O_NOFOLLOW, and there O_EXCL follows a dangling link, so links are refused first
+    if os.path.lexists(path) or any(_is_link(part) for part in (path, path.parent)):
+        raise FileExistsError(errno.EEXIST, "already exists or is a link", str(path))
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    with open(os.open(place, flags, 0o600), "w", encoding="utf-8") as file:
+    descriptor = os.open(path, flags, 0o600)
+    with open(descriptor, "w", encoding="utf-8") as file:
         file.write(url)
+        made = os.fstat(file.fileno())
+    if os.path.realpath(path) != os.path.join(os.path.realpath(path.parent), path.name):
+        try:
+            if os.path.samestat(os.stat(path), made):
+                os.unlink(path)
+        except OSError:
+            pass
+        raise FileExistsError(errno.EEXIST, "the link file went somewhere else", str(path))
+
+
+def _is_link(path):
+    return path.is_symlink() or path.is_junction()
 
 
 def tell(text: str) -> None:
@@ -58,10 +76,15 @@ def tell(text: str) -> None:
 
 
 def log(text: str) -> None:
+    """Only this account can read the log: it can name files."""
     try:
         place = _log_file()
-        place.parent.mkdir(parents=True, exist_ok=True)
-        with open(place, "a", encoding="utf-8") as file:
+        place.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(place, flags, 0o600)
+        with open(descriptor, "a", encoding="utf-8") as file:
+            if hasattr(os, "fchmod"):
+                os.fchmod(file.fileno(), 0o600)
             file.write(f"{datetime.now():%Y-%m-%d %H:%M} {text}\n")
     except OSError:
         pass
@@ -73,7 +96,8 @@ def _log_file():
         return Path(os.environ.get("LOCALAPPDATA") or home / "AppData" / "Local", "Downkeep", "log.txt")
     if sys.platform == "darwin":
         return home / "Library" / "Logs" / "Downkeep.log"
-    return Path(os.environ.get("XDG_STATE_HOME") or home / ".local" / "state", "downkeep", "log.txt")
+    base = Path(os.environ.get("XDG_STATE_HOME") or "")
+    return (base if base.is_absolute() else home / ".local" / "state") / "downkeep" / "log.txt"
 
 
 def _message(text):

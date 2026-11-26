@@ -1,12 +1,13 @@
 import { ask } from "./ask.js";
 import {
   act, bdi, button, ended, entry, facts, folderIcon, go, h, human, list, loading, main, mark, plural, restage, small, stage, state,
-  clean, ticks, toast, total, trouble, visit,
+  baseName, clean, ticks, toast, total, trouble, visit, warnIcon,
 } from "./core.js";
 import { loadRules, showRules } from "./rules.js";
-import { lists, listRuns, loadHistory, showHistory } from "./runs.js";
+import { lists, listRuns, loadHistory, place, showHistory } from "./runs.js";
 
 const HERE = "Leave here";
+const PROVEN = "Proven clutter";
 const off = new Set();
 let plan = null;
 let chosen = null;
@@ -34,6 +35,8 @@ export async function showTidy(focus = false) {
       return;
     }
     plan = found;
+    // Proven clutter belongs in the Trash, not in a folder: it starts unticked
+    for (const move of found.moves) if (move.proven) off.add(move.name);
     if (state.visit !== at) return;
   }
   draw(focus);
@@ -86,24 +89,40 @@ function suggestions(here) {
   return block;
 }
 
+function notices(here) {
+  const proven = here.moves.filter((move) => move.proven).length;
+  const odd = here.moves.filter((move) => move.warning);
+  return [
+    odd.length ? h("p", { class: "banner warn" }, warnIcon(),
+      h("span", {}, `${odd.length === 1 ? "One file looks harmless but is really a program" : `${plural(odd.length, "file")} look harmless but are really programs`}: `,
+        ...odd.slice(0, 3).flatMap((move, index) => [index ? ", " : "", bdi(move.name)]), odd.length > 3 ? " and more" : "", ".")) : null,
+    proven ? h("p", { class: "banner" },
+      `${proven === 1 ? "One file here is" : `${plural(proven, "file")} here are`} proven clutter, so ${proven === 1 ? "it is" : "they are"} left out. `,
+      button("text", "Open Clutter", () => go.tab("clutter"))) : null,
+  ].filter(Boolean);
+}
+
 const withSuggestions = (here, art) => {
-  const block = suggestions(here);
-  return block ? h("div", { class: "hold" }, block, art) : art;
+  const parts = [...notices(here), suggestions(here)].filter(Boolean);
+  return parts.length ? h("div", { class: "hold" }, ...parts, art) : art;
 };
 
 function draw(focus) {
   const here = plan;
+  const home = baseName(state.report.folder);
   const groups = new Map(here.folders.map((folder) => [folder.name, { ...folder, moves: [] }]));
-  for (const move of here.moves) groups.get(move.folder).moves.push(move);
+  const proven = here.moves.filter((move) => move.proven);
+  for (const move of here.moves) if (!move.proven) groups.get(move.folder)?.moves.push(move);
+  for (const [name, group] of groups) if (!group.moves.length) groups.delete(name);
   const picked = () => here.moves.filter((move) => !off.has(move.name));
   const entries = new Map();
-  if (chosen !== HERE && !groups.has(chosen)) chosen = groups.size ? [...groups.keys()][0] : HERE;
+  if (chosen !== HERE && chosen !== PROVEN && !groups.has(chosen)) chosen = groups.size ? [...groups.keys()][0] : proven.length ? PROVEN : HERE;
   if (chosen === HERE && !here.stays.length && groups.size) chosen = [...groups.keys()][0];
 
   list.setAttribute("aria-label", "Folders");
   list.replaceChildren(
     h("h2", {}, "Folders", h("span", {}, plural(here.moves.length + here.stays.length, "file"))),
-    h("ul", {}, ...[...groups.keys(), ...(here.stays.length ? [HERE] : [])].map((name) => {
+    h("ul", {}, ...[...groups.keys(), ...(proven.length ? [PROVEN] : []), ...(here.stays.length ? [HERE] : [])].map((name) => {
       const made = entry(folderIcon(), name, "", () => { open(name); if (small.matches) main.scrollIntoView(); });
       entries.set(name, made);
       return h("li", {}, made);
@@ -114,7 +133,7 @@ function draw(focus) {
 
   function counts() {
     for (const [name, made] of entries) {
-      const moves = groups.get(name)?.moves;
+      const moves = name === PROVEN ? proven : groups.get(name)?.moves;
       const on = moves?.filter((move) => !off.has(move.name)).length;
       made.lastChild.textContent = !moves ? here.stays.length.toLocaleString()
         : on === moves.length ? on.toLocaleString() : `${on.toLocaleString()} of ${moves.length.toLocaleString()}`;
@@ -123,7 +142,8 @@ function draw(focus) {
     const into = new Set(now.map((move) => move.folder)).size;
     tidy.disabled = !now.length;
     tidy.textContent = now.length ? `Tidy ${plural(now.length, "file")}` : "Nothing ticked";
-    return now.length ? `Tidy ${plural(now.length, "file")} into ${plural(into, "folder")}` : "Nothing is ticked, so nothing will move";
+    if (now.length) return `Tidy ${plural(now.length, "file")} into ${plural(into, "folder")}`;
+    return groups.size ? "Nothing is ticked, so nothing will move" : "Nothing left to tidy";
   }
 
   function open(name, first = false) {
@@ -132,15 +152,25 @@ function draw(focus) {
     mark(entries.get(name));
     const say = counts();
     const group = groups.get(name);
+    const warn = (move) => move.warning ?? "";
     stage({
       say,
       why: "Nothing moves until you press Tidy. Untick anything to leave it. Undo puts everything back.",
-      art: withSuggestions(here, group
+      art: withSuggestions(here, name === PROVEN
+        ? ticks(proven, off, {
+          name: (move) => move.name,
+          note: (move, on) => (on ? `to ${place(home, move.folder)}` : "proven clutter, left here"),
+          changed: () => restage(counts()),
+          warn,
+          title: h("h3", {}, "Proven clutter", h("span", {}, ", see the "), button("text inline", "Clutter tab", () => go.tab("clutter"))),
+        })
+        : group
         ? ticks(group.moves, off, {
           name: (move) => move.name,
           note: (move, on) => (on ? move.why : "left here, you unticked it"),
           changed: () => restage(counts()),
-          title: h("h3", {}, "To ", bdi(name), h("span", {}, `${group.exists ? "" : ", a new folder"}, ${human(total(group.moves, "bytes"))}`)),
+          warn,
+          title: h("h3", {}, "To ", bdi(place(home, name)), h("span", {}, `${group.exists ? "" : ", a new folder"}, ${human(total(group.moves, "bytes"))}`)),
         })
         : h("div", { class: "more hold one" }, facts("These stay where they are", here.stays.map((stay) => [stay.name, stay.why])))),
       buttons,
@@ -161,7 +191,7 @@ function draw(focus) {
     stage({
       say: result.done.length ? `Tidied ${plural(result.done.length, "file")} into ${plural(into, "folder")}` : "Nothing was moved",
       why: result.skipped.length ? "Some files were left where they are. The reason is next to each one." : "Undo puts them back.",
-      art: lists(result, "Moved", "Left alone", (name) => (folderOf.has(name) ? `to ${folderOf.get(name)}` : "")),
+      art: lists(result, "Moved", "Left alone", (name) => (folderOf.has(name) ? `to ${place(home, folderOf.get(name))}` : "")),
       buttons: [
         undo ? button("main-act", "Undo", () => go.undo(result.batch, "tidy")) : null,
         button(undo ? "next" : "main-act", "Done", () => go.tab("tidy")),

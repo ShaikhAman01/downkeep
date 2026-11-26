@@ -1,4 +1,5 @@
 import contextlib
+import socket
 import http.client
 import io
 import json
@@ -8,6 +9,7 @@ import tempfile
 import threading
 import time
 import types
+from dataclasses import replace
 import unittest
 from importlib.util import find_spec
 from pathlib import Path
@@ -40,6 +42,9 @@ class FakeActions:
         self.hold = None
         self.suggested = [{"folder": "Bills", "why": "3 files have invoice in the name", "rule": {"words": ["invoice"]}, "files": 3}]
         self.settings = {}
+        self.kept = []
+        self.files = {}
+        self.base = ""
 
     def _do(self, *call):
         self.calls.append(call)
@@ -71,6 +76,19 @@ class FakeActions:
             return self.moves, self.stays, self.suggested
         return [Move(file, "Documents", "a document") for file in scan(folder).files], self.stays, self.suggested
 
+    def keepers(self, folder):
+        self._do("keepers", folder)
+        return list(self.kept)
+
+    def keep_in(self, folder):
+        return []
+
+    def run_files(self, batch):
+        self._do("run_files", batch)
+        if batch not in self.files:
+            raise ActionError("That run isn't in the history")
+        return self.base, self.files[batch]
+
     def name(self, rule):
         self._do("name", rule)
         return "Invoices"
@@ -90,8 +108,8 @@ class FakeActions:
         self._do("history")
         return self.runs
 
-    def undo(self, batch):
-        self._do("undo", batch)
+    def undo(self, batch, names=None):
+        self._do("undo", batch, *([names] if names is not None else []))
         return self.result
 
     def rules(self):
@@ -273,7 +291,7 @@ class TrashTest(ActionsTest):
         self.good("/api/report")
         self.actions.features["trash"] = False
         self.assertEqual(self.refused("/api/trash", {"names": ["b.txt"]}), server.NO_TRASH)
-        self.assertEqual(self.actions.calls, [])
+        self.assertEqual(self.actions.did("trash"), [])
 
 
 class TidyTest(ActionsTest):
@@ -493,6 +511,172 @@ class SuggestTest(ActionsTest):
         self.assertEqual(self.plan()["moves"][0]["why"], "A PDF document")
 
 
+class FixRoundTest(ActionsTest):
+    def moved(self):
+        (self.folder / "Documents").mkdir()
+        (self.folder / "Documents" / "r.pdf").write_bytes(b"x")
+        self.actions.base = str(self.folder)
+        self.actions.files[4] = [
+            {"name": "r.pdf", "to": "Documents", "back": False, "can_put_back": True, "place": str(self.folder / "Documents" / "r.pdf")},
+            {"name": "gone.pdf", "to": "Documents", "back": False, "can_put_back": True, "place": str(self.folder / "Documents" / "gone.pdf")},
+            {"name": "t.pdf", "to": "trash", "back": False, "can_put_back": False, "place": None},
+            {"name": "out.pdf", "to": "..", "back": False, "can_put_back": False, "place": str(self.folder.parent / "out.pdf")},
+            {"name": "back.pdf", "to": "Documents", "back": True, "can_put_back": False, "place": str(self.folder / "a.txt")},
+        ]
+        (self.folder.parent / "out.pdf").write_bytes(b"x")
+
+    def test_show_where_a_run_put_a_file(self):
+        self.moved()
+        self.assertEqual(self.ask("/api/show", {"batch": 4, "name": "r.pdf"})[0], 200)
+        self.assertEqual(self.ask("/api/show", {"batch": 4, "name": "back.pdf"})[0], 200)
+        self.assertEqual(self.app.show.call_args_list, [mock.call(str(self.folder / "Documents" / "r.pdf")), mock.call(str(self.folder / "a.txt"))])
+
+    def test_show_only_from_the_records_and_inside_the_folder(self):
+        self.moved()
+        for body in [
+            {"batch": 4, "name": "gone.pdf"}, {"batch": 4, "name": "t.pdf"}, {"batch": 4, "name": "out.pdf"},
+            {"batch": 4, "name": "missing"}, {"batch": 5, "name": "r.pdf"}, {"batch": "4", "name": "r.pdf"},
+            {"batch": 4, "name": ["r.pdf"]}, {"batch": 0, "name": "r.pdf"}, {"batch": True, "name": "r.pdf"},
+            {"batch": 4, "name": str(self.folder / "Documents" / "r.pdf")},
+        ]:
+            with self.subTest(body=body):
+                self.assertEqual(self.ask("/api/show", body)[0], 404)
+        self.app.show.assert_not_called()
+
+    def test_show_refuses_a_folder_with_a_similar_name(self):
+        self.moved()
+        twin = Path(str(self.folder) + "2")
+        twin.mkdir()
+        (twin / "x.pdf").write_bytes(b"x")
+        self.actions.files[1] = [{"name": "x.pdf", "to": "", "back": False, "can_put_back": False, "place": str(twin / "x.pdf")}]
+        self.assertEqual(self.ask("/api/show", {"batch": 1, "name": "x.pdf"})[0], 404)
+        self.assertEqual(self.ask("/api/show", {"batch": True, "name": "x.pdf"})[0], 404)
+        self.actions.files[1][0]["place"] = str(self.folder / "a.txt")
+        self.assertEqual(self.ask("/api/show", {"batch": True, "name": "x.pdf"})[0], 404)
+        self.assertEqual(self.ask("/api/show", {"batch": 1.0, "name": "x.pdf"})[0], 404)
+        self.app.show.assert_not_called()
+        self.assertEqual(self.ask("/api/show", {"batch": 1, "name": "x.pdf"})[0], 200)
+
+    def test_show_refuses_a_link_or_a_folder_chosen_since(self):
+        self.moved()
+        (self.folder / "Documents" / "r.pdf").unlink()
+        self.symlink("Documents/r.pdf", self.folder.parent / "out.pdf")
+        self.assertEqual(self.ask("/api/show", {"batch": 4, "name": "r.pdf"})[0], 404)
+        (self.folder.parent / "Music").mkdir()
+        self.good("/api/choose", {"path": ["Music"]})
+        self.assertEqual(self.ask("/api/show", {"batch": 4, "name": "back.pdf"})[0], 404)
+        self.app.show.assert_not_called()
+
+    def test_put_back_some_files(self):
+        self.moved()
+        self.good("/api/undo", {"batch": 4, "names": ["r.pdf", "gone.pdf"]})
+        self.assertEqual(self.actions.did("undo"), [("undo", 4, ["r.pdf", "gone.pdf"])])
+
+    def test_put_back_only_files_that_can_go_back(self):
+        self.moved()
+        for names in [["t.pdf"], ["back.pdf"], ["missing"], [], "r.pdf", ["r.pdf", "r.pdf"], [1]]:
+            with self.subTest(names=names):
+                self.refused("/api/undo", {"batch": 4, "names": names})
+        self.refused("/api/undo", {"batch": 5, "names": ["r.pdf"]})
+        self.assertEqual(self.actions.did("undo"), [])
+
+    def test_proven_files_are_marked_in_the_plan(self):
+        self.good("/api/report")
+        moves = {move["name"]: move for move in self.plan()["moves"]}
+        self.assertTrue(moves["b.txt"].get("proven"))
+        self.assertNotIn("proven", moves["a.txt"])
+        self.assertNotIn("proven", moves["c.pdf"])
+
+    def test_nothing_is_marked_before_a_report(self):
+        self.assertFalse(any(move.get("proven") for move in self.plan()["moves"]))
+
+    def test_a_disguised_file_has_a_warning(self):
+        file = scan(self.folder).files[2]
+        self.actions.moves = [Move(file, "Installers", "Named like a .pdf file but really .exe. Installers go to Installers")]
+        move = self.plan()["moves"][0]
+        self.assertEqual(move["warning"], "Named like a .pdf file but really .exe.")
+        self.assertEqual(move["why"], "A PDF document")
+        self.actions.moves = [Move(file, "Documents", "Documents go to Documents")]
+        self.assertNotIn("warning", self.plan()["moves"][0])
+
+    def test_keepers_are_used_for_proof(self):
+        filed = scan(self.folder).files[0]
+        self.actions.kept = [replace(filed, name="Documents/a.txt")]
+        seen = []
+        real = server.find_duplicates
+
+        def duplicates(files, keepers=()):
+            seen.append([file.name for file in keepers])
+            return real(files)
+
+        with mock.patch("downkeep.server.find_duplicates", duplicates):
+            self.good("/api/report")
+        self.assertEqual(seen, [["Documents/a.txt"]])
+
+    def test_a_keeper_is_never_offered_for_the_trash(self):
+        with mock.patch("downkeep.server.build", return_value={"duplicates": [{"names": ["Documents/a.txt", "a.txt", "Documents/x"]}], "extracted": []}):
+            self.good("/api/report")
+        self.assertEqual(self.app.proven, {"a.txt"})
+
+    def test_old_proof_code_still_works(self):
+        self.actions.kept = [scan(self.folder).files[0]]
+        with mock.patch("downkeep.server.find_duplicates", lambda files: []):
+            self.assertEqual(self.good("/api/report")["duplicates"], [])
+
+    def test_another_account_cannot_open_the_session(self):
+        app = App(str(self.folder), mock.Mock(), actions=FakeActions(), same_user=lambda client, port: False)
+        other = make_server(app)
+        threading.Thread(target=other.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
+        self.addCleanup(other.server_close)
+        self.addCleanup(other.shutdown)
+        connection = http.client.HTTPConnection("127.0.0.1", other.server_address[1], timeout=5)
+        self.addCleanup(connection.close)
+        connection.request("POST", "/api/session", json.dumps({"code": app.code}), {"Content-Type": "application/json"})
+        answer = connection.getresponse()
+        self.assertEqual(answer.status, 403)
+        self.assertIn("another account", json.loads(answer.read())["error"])
+        self.assertIsNone(app.key)
+
+
+class PeerTest(unittest.TestCase):
+    def table(self, text):
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        path = Path(holder.name, "tcp")
+        path.write_text("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n" + text)
+        return (str(path),)
+
+    def test_finds_the_owner_of_the_other_end(self):
+        rows = (
+            "   0: 0100007F:8F20 0100007F:9C40 01 00000000:00000000 00:00000000 00000000  1000        0 1\n"
+            "   1: 0100007F:9C40 0100007F:8F20 01 00000000:00000000 00:00000000 00000000  1001        0 2\n"
+        )
+        tables = self.table(rows)
+        self.assertEqual(server.peer_uid(0x9C40, 0x8F20, tables), 1001)
+        self.assertEqual(server.peer_uid(0x8F20, 0x9C40, tables), 1000)
+        self.assertIsNone(server.peer_uid(1, 2, tables))
+
+    def test_odd_tables_mean_unknown(self):
+        for text in ["", "junk\n", "   0: x:y z:w 01 a b c d\n"]:
+            with self.subTest(text=text):
+                self.assertIsNone(server.peer_uid(1, 2, self.table(text)))
+        self.assertIsNone(server.peer_uid(1, 2, ("/missing/tcp",)))
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux only")
+    def test_this_account_on_linux(self):
+        with socket.create_server(("127.0.0.1", 0)) as listener, socket.create_connection(listener.getsockname()) as client:
+            self.assertTrue(server.same_user_here(client.getsockname(), listener.getsockname()[1]))
+        with mock.patch("downkeep.server.peer_uid", return_value=os.getuid() + 1):
+            self.assertFalse(server.same_user_here(("127.0.0.1", 1), 2))
+        with mock.patch("downkeep.server.peer_uid", return_value=None):
+            self.assertFalse(server.same_user_here(("127.0.0.1", 1), 2))
+
+    def test_other_systems_do_not_check(self):
+        for platform in ["win32", "darwin"]:
+            with mock.patch("downkeep.server.sys.platform", platform), mock.patch("downkeep.server.peer_uid", side_effect=AssertionError):
+                self.assertTrue(server.same_user_here(("127.0.0.1", 1), 2))
+
+
 class OtherRoutesTest(ActionsTest):
     def test_undo(self):
         self.assertEqual(self.good("/api/undo", {"batch": 7})["done"], ["b.txt"])
@@ -526,9 +710,18 @@ class OtherRoutesTest(ActionsTest):
 
     def test_automatic(self):
         self.assertFalse(self.good("/api/auto")["on"])
-        self.assertTrue(self.good("/api/auto/set", {"on": True})["on"])
+        self.assertTrue(self.good("/api/auto/set", {"on": True, "confirmed": True})["on"])
         self.assertFalse(self.good("/api/auto/set", {"on": False})["on"])
         self.assertEqual([call[1:] for call in self.actions.did("set_auto")], [(str(self.folder), True), (str(self.folder), False)])
+
+    def test_turning_automatic_on_needs_the_confirm_step(self):
+        for confirmed in [None, False, 1, "true", "yes", []]:
+            with self.subTest(confirmed=confirmed):
+                body = {"on": True} if confirmed is None else {"on": True, "confirmed": confirmed}
+                self.assertEqual(self.refused("/api/auto/set", body), server.NOT_CONFIRMED)
+        self.assertEqual(self.actions.did("set_auto"), [])
+        self.good("/api/auto/set", {"on": False, "confirmed": False})
+        self.assertEqual([call[1:] for call in self.actions.did("set_auto")], [(str(self.folder), False)])
 
     def test_automatic_needs_a_plain_yes_or_no(self):
         for on in [None, 1, 0, "true", "", []]:
@@ -669,7 +862,7 @@ class OneAtATimeTest(ActionsTest):
         started, carry_on = self.waiting()
         self.start("/api/undo", {"batch": 1})
         self.assertTrue(started.wait(5))
-        second = self.start("/api/auto/set", {"on": True})
+        second = self.start("/api/auto/set", {"on": True, "confirmed": True})
         time.sleep(0.15)
         self.assertEqual(self.actions.did("set_auto"), [])
         carry_on.set()
@@ -728,7 +921,13 @@ class FakeStore:
         return None if batch == 404 else types.SimpleNamespace(kind="auto" if batch == 9 else "tidy")
 
     def history(self, limit):
-        return [limit]
+        return [{"batch": 1, "kind": "tidy", "folder": "/d", "limit": limit}]
+
+    def to_undo(self, batch):
+        return []
+
+    def operations(self, batch):
+        return []
 
 
 class DefaultActionsTest(unittest.TestCase):
@@ -763,11 +962,64 @@ class DefaultActionsTest(unittest.TestCase):
         self.actions.set_auto("/d", True)
         self.actions.set_auto("/d", False)
         self.actions.auto_run()
-        self.assertEqual(self.actions.history(5), [5])
+        self.assertEqual(self.actions.history(5), [{"batch": 1, "kind": "tidy", "folder": "/d", "limit": 5, "files": []}])
         self.assertEqual(self.log, [
             ("recover",), ("recover",), ("clear", "/d", ["a"]), ("apply", "/d", [1]), ("undo", 4), ("status", "/d"), ("on", "/d"), ("off",), ("run",),
         ])
         self.assertEqual(FakeStore.opened, FakeStore.closed)
+
+    def test_put_back_some_files_needs_the_new_engine(self):
+        self.modules["engine"].undo = lambda store, batch: Result()
+        with self.assertRaisesRegex(ActionError, "one file at a time"):
+            self.actions.undo(4, ["a"])
+
+    def test_put_back_names_reach_the_engine(self):
+        seen = []
+        self.modules["engine"].undo = lambda store, batch, names=None: (seen.append(names), Result(1, ["a"]))[1]
+        self.actions.undo(4, ["a"])
+        self.actions.undo(4)
+        self.assertEqual(seen, [["a"], None])
+
+    def test_files_of_a_run(self):
+        Op = types.SimpleNamespace
+        ops = [
+            Op(id=1, action="mkdir", state="DONE", source="/d/Documents", dest=None),
+            Op(id=2, action="move", state="DONE", source="/d/a.pdf", dest="/d/Documents/a.pdf"),
+            Op(id=3, action="move", state="DONE", source="/d/b.pdf", dest="/d/Documents/b.pdf"),
+            Op(id=4, action="move", state="ABORTED", source="/d/c.pdf", dest="/d/Documents/c.pdf"),
+            Op(id=5, action="trash", state="DONE", source="/d/z.zip", dest="/t/files/z.zip"),
+            Op(id=6, action="trash", state="DONE", source="/d/w.zip", dest=None),
+        ]
+        store = mock.Mock(operations=lambda batch: ops, to_undo=lambda batch: [ops[1], ops[4], ops[5]])
+        found = server._files(store, 1, "tidy", "/d", places=True)
+        self.assertEqual(found, [
+            {"name": "a.pdf", "to": "Documents", "back": False, "can_put_back": True, "place": "/d/Documents/a.pdf"},
+            {"name": "b.pdf", "to": "Documents", "back": True, "can_put_back": False, "place": "/d/b.pdf"},
+            {"name": "z.zip", "to": "trash", "back": False, "can_put_back": True, "place": None},
+            {"name": "w.zip", "to": "trash", "back": False, "can_put_back": False, "place": None},
+        ])
+        undone = server._files(store, 2, "undo", "/d")
+        self.assertEqual(undone[0], {"name": "Documents/a.pdf".split("/")[-1], "to": "back", "back": False, "can_put_back": False})
+
+    def test_keep_in_only_real_folders_of_rules_that_are_on(self):
+        with tempfile.TemporaryDirectory() as holder:
+            (Path(holder) / "Documents").mkdir()
+            (Path(holder) / "Off").mkdir()
+            (Path(holder) / "Images").write_text("a file")
+            rules = [{"folder": "Documents", "on": True}, {"folder": "Documents", "on": True}, {"folder": "Off", "on": False},
+                     {"folder": "Images", "on": True}, {"folder": "Missing", "on": True}]
+            with mock.patch.object(Actions, "rules", lambda self: {"rules": rules}):
+                self.assertEqual(self.actions.keep_in(holder), ["Documents"])
+                (Path(holder) / "Documents" / "r.pdf").write_bytes(b"x")
+                os.utime(Path(holder) / "Documents" / "r.pdf", (1, 1))
+                self.assertEqual([file.name for file in self.actions.keepers(holder)], ["Documents/r.pdf"])
+
+    def test_trash_passes_the_folders_with_proof(self):
+        seen = []
+        self.modules["clear"].apply_clear = lambda store, folder, names, keep_in=(): (seen.append(list(keep_in)), Result())[1]
+        with mock.patch.object(Actions, "keep_in", lambda self, folder: ["Documents"]):
+            self.actions.trash("/d", ["a"])
+        self.assertEqual(seen, [["Documents"]])
 
     def test_only_an_undone_automatic_run_is_noted(self):
         self.actions.undo(9)
@@ -951,6 +1203,42 @@ class RealTest(ActionsTest):
                 self.refused("/api/rules/save", {"rules": rules})
         self.assertEqual(self.good("/api/rules")["rules"], saved)
 
+    def test_a_copy_of_a_filed_file_is_proven_and_trashed(self):
+        if not self.app.actions.able()["restore"]:
+            self.skipTest("the Recycle Bin can't be checked here")
+        (self.folder / "Documents").mkdir()
+        filed = self.folder / "Documents" / "Resume.pdf"
+        filed.write_bytes(b"resume")
+        os.utime(filed, (1, 1))
+        self.add("Resume (1).pdf", b"resume")
+        report = self.good("/api/report")
+        group = next(group for group in report["duplicates"] if "Resume (1).pdf" in group["names"])
+        self.assertEqual(group["names"], ["Documents/Resume.pdf", "Resume (1).pdf"])
+        self.refused("/api/trash", {"names": ["Documents/Resume.pdf"]})
+        self.assertEqual(self.good("/api/trash", {"names": ["Resume (1).pdf"]})["done"], ["Resume (1).pdf"])
+        self.assertEqual(filed.read_bytes(), b"resume")
+
+    def test_history_shows_and_puts_back_one_file(self):
+        made = self.plan()
+        result = self.good("/api/tidy/apply", {"plan": made["plan"], "names": ["a.txt", "c.pdf"]})
+        run = self.good("/api/history")["batches"][0]
+        self.assertEqual(sorted((file["name"], file["to"], file["can_put_back"]) for file in run["files"]),
+                         [("a.txt", "Documents", True), ("c.pdf", "Documents", True)])
+        self.assertEqual(self.ask("/api/show", {"batch": result["batch"], "name": "c.pdf"})[0], 200)
+        self.app.show.assert_called_once_with(str(self.folder / "Documents" / "c.pdf"))
+        back = self.good("/api/undo", {"batch": result["batch"], "names": ["c.pdf"]})
+        self.assertEqual(back["done"], ["c.pdf"])
+        self.assertTrue((self.folder / "c.pdf").exists())
+        self.assertTrue((self.folder / "Documents" / "a.txt").exists())
+        files = {file["name"]: file for file in self.good("/api/history")["batches"][1]["files"]}
+        self.assertTrue(files["c.pdf"]["back"])
+        self.refused("/api/undo", {"batch": result["batch"], "names": ["c.pdf"]})
+
+    def test_proven_files_stay_out_of_tidy(self):
+        self.good("/api/report")
+        moves = {move["name"]: move.get("proven", False) for move in self.plan()["moves"]}
+        self.assertEqual(moves, {"a.txt": False, "b.txt": True, "c.pdf": False})
+
     def test_suggestions_and_names(self):
         from downkeep import sorting
 
@@ -974,7 +1262,7 @@ class RealTest(ActionsTest):
 
     def test_automatic(self):
         self.assertFalse(self.good("/api/auto")["on"])
-        status = self.good("/api/auto/set", {"on": True})
+        status = self.good("/api/auto/set", {"on": True, "confirmed": True})
         self.assertEqual((status["on"], status["folder"]), (True, str(self.folder)))
         self.assertEqual(self.installed, ["/here/downkeep", "--auto-run"])
         self.app.actions.auto_run()
