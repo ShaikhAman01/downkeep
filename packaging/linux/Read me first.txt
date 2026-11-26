@@ -1,0 +1,62 @@
+Downkeep
+Careful cleanup for your Downloads folder.
+
+
+TO OPEN IT
+
+Unpack the download, open the downkeep folder and run the file named downkeep.
+If a double-click does nothing, open a terminal in that folder and type
+   ./downkeep
+
+It opens in its own window, using a browser you already have.
+
+
+TO PUT IT IN YOUR MENU
+
+Open a terminal in the unpacked folder and type
+   ./install.sh
+
+It copies Downkeep to ~/.local/lib/downkeep and adds a menu entry. It needs no
+password, asks nothing, and never replaces a file it did not put there. After
+that you can delete the unpacked folder. Run the install.sh of a newer download
+to update.
+
+If you want to use Automatic, install it first, so that it stays in one place.
+
+
+TO CHECK THE DOWNLOAD
+
+The release page lists a SHA-256 for it. In the folder with the download, type
+   sha256sum downkeep-*.tar.gz
+The two must be the same.
+
+
+WHAT IT DOES
+
+- Shows what is in your Downloads folder and what takes space.
+- Finds exact copies, and zips whose every file is already unpacked. Nothing
+  else is called clutter. You choose what goes to the Trash.
+- Tidies loose files into folders. You see the plan first, and can undo it.
+- If you turn Automatic on, it tidies new files every hour. It starts off.
+  Automatic never uses the Trash.
+
+
+WHAT IT NEVER DOES
+
+- It never deletes a file for good.
+- It never replaces a file with another one.
+- It never sends anything anywhere. The window is served from your own
+  computer and only answers to itself.
+- It never asks for a password.
+
+
+TO REMOVE IT
+
+1. Close Downkeep, open a terminal and type
+   ~/.local/lib/downkeep/uninstall.sh
+   This also turns Automatic off.
+2. If you never installed it, turn Automatic off in Downkeep, then delete
+   the folder.
+3. To remove its history too, delete ~/.local/state/downkeep
+
+Files that were tidied stay where they are.

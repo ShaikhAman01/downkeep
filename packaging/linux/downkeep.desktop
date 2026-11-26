@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Downkeep
+Comment=Careful cleanup for your Downloads folder
+Exec=downkeep
+Icon=downkeep
+Terminal=false
+Categories=Utility;FileTools;
+Keywords=downloads;clean;tidy;duplicates;trash;
