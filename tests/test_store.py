@@ -54,6 +54,25 @@ class Opening(StoreTest):
         for file in self.folder.iterdir():
             self.assertEqual(file.stat().st_mode & 0o077, 0, file)
 
+    @unittest.skipIf(sys.platform == "win32", "POSIX permissions")
+    def test_an_existing_folder_is_made_private(self):
+        self.store.close()
+        self.folder.chmod(0o755)
+        self.open()
+        self.assertEqual(self.folder.stat().st_mode & 0o777, 0o700)
+
+    def test_records_from_the_first_version_are_brought_forward(self):
+        self.store.close()
+        old = self.folder.parent / "old"
+        with mock.patch.object(module, "MIGRATIONS", MIGRATIONS[:1]):
+            with Store(old) as first:
+                first.intent(first.begin("tidy", "/d"), "move", "/d/a", "/d/to/a", FILE)
+        with Store(old) as store:
+            (op,) = store.open_intents()
+            self.assertFalse(op.other_file)
+            store.finish(op.id, "CONFLICT", "x", identity=FILE, other_file=True)
+            self.assertTrue(store.operations(op.batch)[0].other_file)
+
     def test_opens_again_with_everything(self):
         batch = self.store.begin("tidy", "/d")
         self.move(batch, "a")
@@ -299,6 +318,23 @@ class History(StoreTest):
         self.assertEqual((shown[2]["undone"], shown[2]["can_undo"]), (True, False))
         self.assertEqual((shown[0]["kind"], shown[0]["names"], shown[0]["can_undo"]), ("undo", ["b"], False))
 
+    def test_a_different_file_moved_in_place_can_be_put_back(self):
+        batch = self.store.begin("tidy", "/d")
+        op = self.store.intent(batch, "move", "/d/a", "/d/to/a", FILE)
+        self.store.finish(op, "CONFLICT", "A different file was moved", identity=Identity(1, 2, 3, 4), other_file=True)
+        (waiting,) = self.store.to_undo(batch)
+        self.assertEqual(waiting.identity, Identity(1, 2, 3, 4))
+        (run,) = self.store.history()
+        self.assertEqual((run["count"], run["can_undo"]), (0, True))
+        plain = self.store.begin("tidy", "/d")
+        self.move(plain, "b", "CONFLICT", "lost")
+        self.assertEqual(self.store.to_undo(plain), [])
+
+    def test_batch_knows_when_it_started(self):
+        before = time.time_ns()
+        batch = self.store.begin("tidy", "/d")
+        self.assertLessEqual(before, self.store.batch(batch).started_ns)
+
     def test_a_failed_undo_doesnt_count(self):
         batch = self.store.begin("tidy", "/d")
         self.move(batch, "a")
@@ -405,6 +441,17 @@ class Seen(StoreTest):
     def test_leave_a_file_never_seen(self):
         self.store.leave(FILE)
         self.assertTrue(self.store.is_left(FILE))
+
+    def test_the_ledger_has_a_limit(self):
+        with mock.patch.object(module, "MOST_SEEN", 3):
+            for inode in range(5):
+                self.store.remember([record(inode=inode)], inode)
+        self.assertEqual(self.store._run("SELECT inode FROM seen ORDER BY id"), [("2",), ("3",), ("4",)])
+
+    def test_left_with_a_name_is_not_a_new_file(self):
+        self.store.leave(record())
+        self.assertTrue(self.store.is_left(record(mtime_ns=500)))
+        self.assertFalse(self.store.is_left(record(name="other", mtime_ns=500)))
 
     def test_prune(self):
         self.store.remember([record(), record(name="b", inode=8)], 5)

@@ -1,6 +1,7 @@
 import json
 import os
 import random
+import signal
 import subprocess
 import sys
 import tempfile
@@ -25,14 +26,16 @@ from downkeep.model import Move
 from downkeep.scan import scan
 from downkeep.store import Store
 
-action, folder, data, stop, plan = sys.argv[1], sys.argv[2], Path(sys.argv[3]), int(sys.argv[4]), json.loads(sys.argv[5])
+action, folder, data, stop = sys.argv[1], sys.argv[2], Path(sys.argv[3]), int(sys.argv[4])
+plan = json.loads(sys.argv[5])
 steps = 0
 
 def step(*_):
     global steps
     steps += 1
     if steps == stop:
-        os.kill(os.getpid(), signal.SIGKILL) if os.name == "posix" else os._exit(9)
+        # TerminateProcess on Windows: as hard as SIGKILL, nothing is cleaned up
+        os.kill(os.getpid(), signal.SIGKILL if os.name == "posix" else signal.SIGTERM)
 
 def around(owner, name):
     real = getattr(owner, name)
@@ -79,7 +82,7 @@ class CrashTest(unittest.TestCase):
             capture_output=True, timeout=60,
             env={**os.environ, "PYTHONPATH": str(Path(engine.__file__).parents[1]), "PYTHONDONTWRITEBYTECODE": "1"},
         )
-        killed = done.returncode in (-9, 9)
+        killed = done.returncode == (-signal.SIGKILL if os.name == "posix" else signal.SIGTERM)
         if done.returncode and not killed:
             raise AssertionError(done.stderr.decode(errors="replace"))
         return None if killed else int(done.stdout)
@@ -232,7 +235,7 @@ class EveryStep(CrashTest):
 
 class Random(CrashTest):
     ODD = ["{} photo.png", "ü日本 {}.pdf", "{}", "{} \U0001f600.zip", "-rf {}", "{}.tar.gz", "It's {}; --"]
-    LINUX_ODD = ["line\nbreak {}", " {} ", "{}\\:*?.txt", os.fsdecode(b"\xff\xfe {}")]
+    LINUX_ODD = ["line\nbreak {}", " {} ", "{}\\:*?.txt", "\udcff\udcfe {}"]
 
     def test_200_files_and_many_crashes(self):
         chance = random.Random(20261125)
@@ -244,9 +247,8 @@ class Random(CrashTest):
         names = sorted(case.tree())
         for name in chance.sample(names, 20):
             case.keep(os.path.join(chance.choice(folders), name), b"mine " + os.fsencode(name))
-        if sys.platform == "linux":
-            for name in chance.sample(names, 20):
-                (case.folder / name).chmod(0o444)
+        for name in chance.sample(names, 20):
+            (case.folder / name).chmod(0o444)
         case.start()
 
         crashes = 0

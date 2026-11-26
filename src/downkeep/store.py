@@ -22,6 +22,7 @@ KINDS = ("tidy", "auto", "trash", "undo")
 ACTIONS = ("move", "mkdir", "rmdir", "trash")
 FINISHED = ("DONE", "ABORTED", "CONFLICT")
 NAMES_SHOWN = 200
+MOST_SEEN = 100_000
 WAIT_TRIES = 200
 
 # Device and inode are text because Windows numbers can be too big for SQLite.
@@ -44,6 +45,7 @@ MIGRATIONS = (
             id INTEGER PRIMARY KEY, device TEXT NOT NULL, inode TEXT NOT NULL, mtime_ns INTEGER NOT NULL,
             name BLOB, first_ns INTEGER NOT NULL, stays INTEGER NOT NULL DEFAULT 0, UNIQUE (inode, device))""",
     ),
+    ("ALTER TABLE operations ADD COLUMN other_file INTEGER NOT NULL DEFAULT 0",),
 )
 
 
@@ -57,6 +59,7 @@ class Op:
     identity: Identity | None
     state: str
     reason: str
+    other_file: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +68,7 @@ class Batch:
     kind: str
     folder: str
     undoes: int | None
+    started_ns: int = 0
 
 
 def data_folder() -> Path:
@@ -86,6 +90,7 @@ class Store:
         self._guard = threading.RLock()
         try:
             self.folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+            _private(self.folder)
             os.close(os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600))
             self._db = sqlite3.connect(self.path, timeout=10, isolation_level=None, check_same_thread=False)
         except (OSError, sqlite3.Error) as error:
@@ -102,7 +107,8 @@ class Store:
                 return self._prepare()
             except sqlite3.Error as error:
                 # SQLite doesn't wait by itself when two programs first open the file together
-                if left and getattr(error, "sqlite_errorcode", 0) & 0xFF in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                code = getattr(error, "sqlite_errorcode", 0) & 0xFF
+                if left and code in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
                     time.sleep(0.05)
                     continue
                 raise ActionError(
@@ -195,10 +201,10 @@ class Store:
         self._run("UPDATE batches SET ended_ns = ? WHERE id = ? AND ended_ns IS NULL", time.time_ns(), batch)
 
     def batch(self, batch: int) -> Batch | None:
-        for number, kind, folder, undoes in self._run(
-            "SELECT id, kind, folder, undoes FROM batches WHERE id = ?", batch
+        for number, kind, folder, undoes, started_ns in self._run(
+            "SELECT id, kind, folder, undoes, started_ns FROM batches WHERE id = ?", batch
         ):
-            return Batch(number, kind, os.fsdecode(folder), undoes)
+            return Batch(number, kind, os.fsdecode(folder), undoes, started_ns)
         return None
 
     def intent(self, batch: int, action: str, source: str, dest: str | None, identity: Identity | None) -> int:
@@ -218,15 +224,18 @@ class Store:
         return op
 
     def finish(
-        self, op: int, state: str, reason: str = "", dest: str | None = None, identity: Identity | None = None
+        self, op: int, state: str, reason: str = "", dest: str | None = None, identity: Identity | None = None,
+        other_file: bool = False,
     ) -> None:
+        """other_file: a different file than the one checked went to dest, and identity is that file's."""
         _expect(state, FINISHED)
         device, inode, size, mtime_ns = _columns(identity)
         changed = self._run(
-            "UPDATE operations SET state = ?, reason = ?, dest = COALESCE(?, dest), device = COALESCE(?, device),"
+            "UPDATE operations SET state = ?, reason = ?, other_file = ?, dest = COALESCE(?, dest),"
+            " device = COALESCE(?, device),"
             " inode = COALESCE(?, inode), size = COALESCE(?, size), mtime_ns = COALESCE(?, mtime_ns)"
             " WHERE id = ? AND state = 'INTENT' RETURNING id",
-            state, reason, _bytes(dest), device, inode, size, mtime_ns, op,
+            state, reason, int(other_file), _bytes(dest), device, inode, size, mtime_ns, op,
         )
         if not changed:
             raise ValueError(f"operation {op} is not open")
@@ -239,13 +248,14 @@ class Store:
 
     def _ops(self, where, *values):
         rows = self._run(
-            "SELECT id, batch, action, source, dest, device, inode, size, mtime_ns, state, reason"
+            "SELECT id, batch, action, source, dest, device, inode, size, mtime_ns, state, reason, other_file"
             f" FROM operations WHERE {where} ORDER BY id", *values,
         )
         return [_op(row) for row in rows]
 
     def to_undo(self, batch: int) -> list[Op]:
-        """Finished moves of this batch that no undo has brought back yet, newest first."""
+        """Finished moves of this batch that no undo has brought back yet, newest first.
+        A different file that was moved in place of the checked one can be brought back too."""
         back = {
             row[0]
             for row in self._run(
@@ -253,7 +263,10 @@ class Store:
                 " WHERE undoes = ? AND action = 'move' AND state = 'DONE'", batch,
             )
         }
-        moved = [op for op in self.operations(batch) if op.state == "DONE" and op.action in ("move", "trash")]
+        moved = [
+            op for op in self.operations(batch)
+            if op.action in ("move", "trash") and (op.state == "DONE" or (op.state == "CONFLICT" and op.other_file))
+        ]
         return [op for op in reversed(moved) if os.fsencode(op.source) not in back]
 
     def history(self, limit: int = 30) -> list[dict]:
@@ -331,6 +344,7 @@ class Store:
         return None
 
     def _note(self, file, ns):
+        self._run("DELETE FROM seen WHERE id <= (SELECT max(id) FROM seen) - ?", MOST_SEEN - 1)
         row = self._find(file)
         place = str(file.device), str(file.inode)
         self._run("DELETE FROM seen WHERE device = ? AND inode = ? AND id IS NOT ?", *place, row and row[0])
@@ -345,6 +359,11 @@ class Store:
             *place, file.mtime_ns, _name(file), ns,
         )
         return number
+
+
+def _private(folder):
+    if sys.platform != "win32" and folder.stat().st_uid == os.geteuid():
+        folder.chmod(0o700)
 
 
 def _grab(descriptor):
@@ -386,9 +405,9 @@ def _columns(identity):
 
 
 def _op(row):
-    number, batch, action, source, dest, device, inode, size, mtime_ns, state, reason = row
+    number, batch, action, source, dest, device, inode, size, mtime_ns, state, reason, other_file = row
     identity = None if inode is None else Identity(int(device), int(inode), size, mtime_ns)
     return Op(
         number, batch, action, os.fsdecode(source), None if dest is None else os.fsdecode(dest),
-        identity, state, reason,
+        identity, state, reason, bool(other_file),
     )

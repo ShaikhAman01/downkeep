@@ -1,10 +1,12 @@
 import contextlib
+import ntpath
 import ctypes
 import errno
 import os
 import shutil
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import time
@@ -13,7 +15,7 @@ from collections.abc import Callable, Iterator, Sequence
 
 from downkeep import origin
 from downkeep.model import ActionError, Identity, Move, Result, Stay
-from downkeep.scan import ScanError, _classify, check_folder
+from downkeep.scan import FileRecord, ScanError, _classify, check_folder
 from downkeep.store import Op, Store
 
 if sys.platform == "win32":
@@ -26,6 +28,11 @@ MOVEFILE_WRITE_THROUGH = 8
 GENERIC_READ = 0x80000000
 OPEN_EXISTING = 3
 FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+FILE_READ_ATTRIBUTES = 0x80
+SHARE_READ_WRITE, SHARE_ALL = 3, 7
+AT_FDCWD, AT_SYMLINK_NOFOLLOW, STATX_BTIME = -100, 0x100, 0x800
 INVALID_HANDLE = ctypes.c_void_p(-1).value
 LONG_PATH = 240
 
@@ -43,6 +50,8 @@ CHANGED = "It changed after the check."
 BUSY = "Another program may be using it."
 TWO_NAMES = "It has a second name on this disk (a hard link)."
 OTHER_DISK = "It is on another disk."
+STOPPED = "Automatic tidying was turned off."
+DIFFERENT = "A different file is there now."
 NOT_YET = "Moving files is not available on this system yet."
 RESERVED = {"con", "prn", "aux", "nul", *(f"{port}{n}" for port in ("com", "lpt") for n in range(1, 10))}
 
@@ -51,6 +60,10 @@ ABSENT, MATCH, OTHER = "absent", "match", "other"
 
 class _Recorded(ActionError):
     """A skip that is already in the records."""
+
+
+class _Misplaced(ActionError):
+    """Windows moved the file somewhere other than the folder that was checked."""
 
 
 def _checkpoint(step: str) -> None:
@@ -125,6 +138,10 @@ def _kernel32():
     library.CreateFileW.restype = wintypes.HANDLE
     library.CloseHandle.argtypes = [wintypes.HANDLE]
     library.CloseHandle.restype = wintypes.BOOL
+    library.GetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+    library.GetFileInformationByHandle.restype = wintypes.BOOL
+    library.GetFinalPathNameByHandleW.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
+    library.GetFinalPathNameByHandleW.restype = wintypes.DWORD
     return library
 
 
@@ -133,8 +150,60 @@ def _last_error():
 
 
 def _windows_move(source, dest):
-    if not _kernel32().MoveFileExW(_long(source), _long(dest), MOVEFILE_WRITE_THROUGH):
-        raise _windows_error(_last_error(), source, dest)
+    """The folder is held open without delete sharing, so it can't be swapped for a link during the move."""
+    library, folder = _kernel32(), ntpath.dirname(dest)
+    held = _open(library, folder, SHARE_READ_WRITE)
+    try:
+        attributes = _attributes(library, held)
+        if attributes is None or attributes & FILE_ATTRIBUTE_REPARSE_POINT:
+            raise ActionError(f"{ntpath.basename(folder)} is not a normal folder.")
+        expected = _final_path(library, held)
+        if not library.MoveFileExW(_long(source), _long(dest), MOVEFILE_WRITE_THROUGH):
+            raise _windows_error(_last_error(), source, dest)
+        landed = _final_path_of(library, dest)
+        if None in (expected, landed) or ntpath.normcase(ntpath.dirname(landed)) != ntpath.normcase(expected):
+            back = library.MoveFileExW(_long(dest), _long(source), MOVEFILE_WRITE_THROUGH)
+            where = "It was put back." if back else f"Look in: {landed or dest}"
+            raise _Misplaced(f"The folder led somewhere else. {where}")
+    finally:
+        library.CloseHandle(held)
+
+
+def _open(library, path, sharing):
+    handle = library.CreateFileW(
+        _long(path), FILE_READ_ATTRIBUTES, sharing, None, OPEN_EXISTING,
+        FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, None,
+    )
+    if handle in (None, INVALID_HANDLE):
+        raise _windows_error(_last_error(), path, path)
+    return handle
+
+
+def _attributes(library, handle):
+    information = (ctypes.c_uint32 * 13)()
+    return information[0] if library.GetFileInformationByHandle(handle, information) else None
+
+
+def _final_path_of(library, path):
+    try:
+        handle = _open(library, path, SHARE_ALL)
+    except (ActionError, OSError):
+        return None
+    try:
+        return _final_path(library, handle)
+    finally:
+        library.CloseHandle(handle)
+
+
+def _final_path(library, handle):
+    """Where the system says an open file or folder really is, with links and drive tricks resolved."""
+    text = ctypes.create_unicode_buffer(32_768)
+    if not library.GetFinalPathNameByHandleW(handle, text, len(text), 0):
+        return None
+    found = text.value
+    if found.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + found[8:]
+    return found.removeprefix("\\\\?\\")
 
 
 def _windows_error(code, source, dest):
@@ -218,7 +287,9 @@ def _gio(command):
         return b""
 
 
-def apply_moves(store: Store, folder: str, moves: Sequence[Move], kind: str = "tidy") -> Result:
+def apply_moves(
+    store: Store, folder: str, moves: Sequence[Move], kind: str = "tidy", should_stop: Callable[[], bool] | None = None
+) -> Result:
     if not SUPPORTED:
         raise ActionError(NOT_YET)
     result = Result()
@@ -232,9 +303,13 @@ def apply_moves(store: Store, folder: str, moves: Sequence[Move], kind: str = "t
             raise ActionError(str(error)) from error
         result.batch = store.begin(kind, root)
         _checkpoint("batch started")
-        for move in moves:
-            source = os.path.join(root, move.file.name)
-            with _each(store, result, move.file.name, source):
+        for index, move in enumerate(moves):
+            if should_stop and should_stop():
+                for left in moves[index:]:
+                    with _each(store, result, left.file.name, os.path.join(root, left.file.name)):
+                        raise ActionError(STOPPED)
+                break
+            with _each(store, result, move.file.name, os.path.join(root, move.file.name)):
                 _apply(store, result.batch, root, move)
         _remove_empty(store, result.batch, result.batch)
         store.end(result.batch)
@@ -307,8 +382,40 @@ def _make_folder(store, batch, path):
         raise
     _checkpoint("folder made")
     _sync(os.path.dirname(path))
-    store.finish(op, "DONE", identity=_identity(os.lstat(path)))
+    store.finish(op, "DONE", identity=_folder_identity(path))
     _checkpoint("folder saved")
+
+
+def _folder_identity(path):
+    """A folder's date changes with what is in it, so its birth time is kept instead (0 if unknown)."""
+    info = os.lstat(path)
+    return Identity(info.st_dev, info.st_ino, 0, _born_ns(path, info) or 0)
+
+
+def _born_ns(path, info=None):
+    if sys.platform == "win32":
+        return getattr(info or os.lstat(path), "st_birthtime_ns", None)
+    statx = _statx_function()
+    if statx is None:
+        return None
+    answer = ctypes.create_string_buffer(256)
+    if statx(AT_FDCWD, os.fsencode(path), AT_SYMLINK_NOFOLLOW, STATX_BTIME, answer):
+        return None
+    (mask,) = struct.unpack_from("<I", answer, 0)
+    seconds, nanoseconds = struct.unpack_from("<qI", answer, 80)
+    return seconds * 1_000_000_000 + nanoseconds if mask & STATX_BTIME else None
+
+
+def _statx_function():
+    if sys.platform != "linux":
+        return None
+    try:
+        function = ctypes.CDLL(None, use_errno=True).statx
+    except (AttributeError, OSError):
+        return None
+    function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_uint, ctypes.c_void_p]
+    function.restype = ctypes.c_int
+    return function
 
 
 def _check_free(folder, name):
@@ -331,20 +438,27 @@ def _move(store, batch, source, dest, identity, move: Callable[[], None] | None 
     site = site_of(source)
     op = store.intent(batch, "move", source, dest, identity)
     _checkpoint("move planned")
-    why = ""
+    why = misplaced = ""
     try:
         if _now(source) != identity:
             raise ActionError(CHANGED)
         (move or (lambda: move_no_replace(source, dest)))()
     except FileExistsError:
         why = _taken(os.path.dirname(dest))
+    except _Misplaced as error:
+        why = misplaced = str(error)
     except (ActionError, OSError) as error:
         why = _reason(error)
     _checkpoint("moved")
     try:
-        state, reason = ("ABORTED", why) if why and _look(dest, identity) != MATCH else _outcome(source, dest, identity)
+        if why and _look(dest, identity) != MATCH:
+            state, reason, stranger = "ABORTED", why, None
+        else:
+            state, reason, stranger = _outcome(source, dest, identity)
+        if misplaced:
+            state, reason, stranger = "CONFLICT", misplaced, None
         _checkpoint("move checked")
-        store.finish(op, state, reason)
+        store.finish(op, state, reason, identity=stranger, other_file=bool(stranger))
     except (ActionError, OSError) as error:
         raise _Recorded(f"Downkeep will check it again the next time it opens. {_reason(error)}") from error
     _checkpoint("move saved")
@@ -355,11 +469,24 @@ def _move(store, batch, source, dest, identity, move: Callable[[], None] | None 
 
 
 def _outcome(source, dest, identity):
-    state, reason = _judge(_look(source, identity), _look(dest, identity))
+    """Also returns the identity of a different file that went to the destination, so undo can bring it back."""
+    at_dest = _look(dest, identity)
+    state, reason = _judge(_look(source, identity), at_dest)
     if state == "DONE":
         _sync(os.path.dirname(dest))
         _sync(os.path.dirname(source))
-    return state, f"{reason} Look in: {source} and {dest}" if state == "CONFLICT" else reason
+    if state != "CONFLICT":
+        return state, reason, None
+    stranger = _plain_file(dest) if at_dest == OTHER else None
+    if stranger:
+        place = os.path.join(os.path.basename(os.path.dirname(dest)), os.path.basename(dest))
+        return state, f"A different file was moved to {place}; look there.", stranger
+    return state, f"{reason} Look in: {source} and {dest}", None
+
+
+def _plain_file(path):
+    info = os.lstat(path)
+    return _identity(info) if stat.S_ISREG(info.st_mode) and info.st_nlink == 1 else None
 
 
 def _judge(source: str, dest: str) -> tuple[str, str]:
@@ -457,13 +584,15 @@ def _remove_folder(store, batch, op):
 
 def _ours_and_empty(op):
     info = _real_folder(op.source)
-    if info is None or info.st_ino != op.identity.inode:
+    now = _folder_identity(op.source) if info else None
+    if now is None or (now.inode, now.mtime_ns) != (op.identity.inode, op.identity.mtime_ns):
         return False
     with os.scandir(op.source) as listing:
         return next(listing, None) is None
 
 
-def undo(store: Store, batch: int) -> Result:
+def undo(store: Store, batch: int, names: Sequence[str] | None = None) -> Result:
+    """Puts back the whole batch, or only the files with these names; the rest can still be put back later."""
     if not SUPPORTED:
         raise ActionError(NOT_YET)
     result = Result()
@@ -472,25 +601,31 @@ def undo(store: Store, batch: int) -> Result:
         before = store.batch(batch)
         if before is None or before.kind == "undo":
             raise ActionError("There is no such change to undo.")
-        waiting = store.to_undo(batch)
+        waiting = [op for op in store.to_undo(batch) if names is None or os.path.basename(op.source) in names]
         if not waiting:
             raise ActionError("Everything from that change is already back, or can't be brought back.")
         result.batch = store.begin("undo", before.folder, undoes=batch)
         _checkpoint("batch started")
         for op in waiting:
             with _each(store, result, os.path.basename(op.source), op.dest or op.source):
-                _restore(store, result.batch, op) if op.action == "trash" else _put_back(store, result.batch, op)
+                _bring_back(store, result.batch, op, before.started_ns)
         _remove_empty(store, result.batch, batch)
         store.end(result.batch)
         _checkpoint("batch ended")
     return result
 
 
-def _put_back(store, batch, op):
+def _bring_back(store, batch, op, since):
+    from_trash = op.action == "trash"
+    if from_trash:
+        from downkeep import trash
+
+        if not op.dest or not getattr(trash, "CAN_RESTORE", False):
+            raise ActionError("Downkeep can't bring it back here. Open the Trash or Recycle Bin to restore it.")
     here, home = os.path.dirname(op.dest), os.path.dirname(op.source)
     if _real_folder(here) is None:
         raise ActionError(f"It is no longer in {os.path.basename(here)}.")
-    identity = _still_it(op)
+    identity = _still_it(op, since)
     folder = _real_folder(home)
     if folder is None or os.path.realpath(home) != home:
         raise ActionError("The folder it came from is no longer there.")
@@ -498,13 +633,15 @@ def _put_back(store, batch, op):
         raise ActionError(OTHER_DISK)
     if in_use(op.dest):
         raise ActionError(BUSY)
-    _check_free(home, os.path.basename(op.source))
+    name = os.path.basename(op.source)
+    _check_free(home, name)
     # first, so a crash can't let automatic move it again
-    store.leave(identity)
-    _move(store, batch, op.dest, op.source, identity)
+    store.leave(FileRecord(name, op.source, identity.size, identity.mtime_ns, identity.device, identity.inode, 1))
+    restore = (lambda: trash.restore(op.source, op.dest, identity)) if from_trash else None
+    _move(store, batch, op.dest, op.source, identity, restore)
 
 
-def _still_it(op):
+def _still_it(op, since):
     if not os.path.lexists(op.dest):
         raise ActionError(f"It is no longer in {os.path.basename(os.path.dirname(op.dest))}.")
     identity = _now(op.dest)
@@ -512,17 +649,13 @@ def _still_it(op):
     if identity.inode != op.identity.inode or (
         identity.device != op.identity.device and _look(op.dest, op.identity) != MATCH
     ):
-        raise ActionError("A different file is there now.")
+        raise ActionError(DIFFERENT)
+    # a new file can get the number of a deleted one; only its birth time tells them apart
+    edited = identity.size != op.identity.size and identity.mtime_ns != op.identity.mtime_ns
+    born = _born_ns(op.dest) if edited else None
+    if born is not None and born > since:
+        raise ActionError(DIFFERENT)
     return identity
-
-
-def _restore(store, batch, op):
-    from downkeep import trash
-
-    if not op.dest or not getattr(trash, "CAN_RESTORE", False):
-        raise ActionError("Downkeep can't bring it back here. Open the Trash or Recycle Bin to restore it.")
-    identity = _still_it(op)
-    _move(store, batch, op.dest, op.source, identity, lambda: trash.restore(op.source, op.dest, identity))
 
 
 def recover(store: Store) -> Result:
@@ -536,12 +669,12 @@ def _recover(store):
     for op in store.open_intents():
         name = os.path.basename(op.source)
         try:
-            state, reason, dest = _settle(op)
+            state, reason, dest, stranger = _settle(op)
         except OSError as error:
             result.skipped.append(Stay(name, _reason(error)))
             continue
         _checkpoint("settled")
-        store.finish(op.id, state, reason, dest)
+        store.finish(op.id, state, reason, dest, identity=stranger, other_file=bool(stranger))
         _checkpoint("settlement saved")
         if state == "DONE":
             result.done.append(name)
@@ -551,15 +684,16 @@ def _recover(store):
     return result
 
 
-def _settle(op: Op) -> tuple[str, str, str | None]:
+def _settle(op: Op) -> tuple[str, str, str | None, Identity | None]:
     if op.action == "mkdir":
-        return _settle_mkdir(op)
+        return *_settle_mkdir(op), None
     if op.action == "rmdir":
         info = _real_folder(op.source)
-        return ("ABORTED" if info and info.st_ino == op.identity.inode else "DONE"), "", None
+        return ("ABORTED" if info and info.st_ino == op.identity.inode else "DONE"), "", None, None
     if op.action == "trash" and not op.dest:
-        return _settle_trash(op)
-    return *_outcome(op.source, op.dest, op.identity), None
+        return *_settle_trash(op), None
+    state, reason, stranger = _outcome(op.source, op.dest, op.identity)
+    return state, reason, None, stranger
 
 
 def _settle_mkdir(op):
@@ -572,6 +706,8 @@ def _settle_trash(op):
     from downkeep import trash
 
     if _look(op.source, op.identity) == MATCH:
+        with contextlib.suppress(OSError):
+            getattr(trash, "drop_notes", lambda source: None)(op.source)
         return "ABORTED", "It was not moved to the Trash. It is still in its place.", None
     find = getattr(trash, "find", None)
     place = find(op.source, op.identity) if find else None

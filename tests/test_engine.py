@@ -4,6 +4,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,7 +19,14 @@ from tests.helpers import FolderTest
 
 LINUX = sys.platform == "linux"
 needs_moves = unittest.skipUnless(engine.SUPPORTED, "moving files is not available on this system")
-needs_linux = unittest.skipUnless(LINUX and engine.SUPPORTED, "Linux only")
+WINDOWS = sys.platform == "win32"
+
+
+def linux_only(why):
+    return unittest.skipUnless(LINUX and engine.SUPPORTED, why)
+
+
+needs_running = unittest.skipUnless(engine.SUPPORTED, "the in-use check needs Linux or Windows")
 not_root = unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores permissions")
 
 
@@ -66,6 +74,16 @@ class MoveTest(FolderTest):
         patch.start()
         self.addCleanup(patch.stop)
 
+    def folder_link(self, name, target):
+        """A junction on Windows, which needs no special rights; a symbolic link elsewhere."""
+        path = self.folder / name
+        if WINDOWS:
+            import _winapi
+
+            _winapi.CreateJunction(str(target), str(path))
+        else:
+            path.symlink_to(target)
+
 
 @needs_moves
 class Primitive(MoveTest):
@@ -103,24 +121,37 @@ class Primitive(MoveTest):
                 move_no_replace(*names)
         self.assertEqual(list(self.tree()), ["a"])
 
-    @needs_linux
     def test_a_link_is_never_a_destination_folder(self):
         outside = self.folder.parent / "outside"
         outside.mkdir()
         source = self.add("a")
-        self.symlink("link", outside)
-        with self.assertRaises(OSError):
+        self.folder_link("link", outside)
+        with self.assertRaises((OSError, ActionError)):
             move_no_replace(str(source), str(self.folder / "link" / "a"))
         self.assertEqual((list(outside.iterdir()), source.exists()), ([], True))
 
-    @needs_linux
+    def test_a_symbolic_link_is_never_a_destination_folder(self):
+        outside = self.folder.parent / "outside"
+        outside.mkdir()
+        source = self.add("a")
+        self.symlink("link", outside)
+        with self.assertRaises((OSError, ActionError)):
+            move_no_replace(str(source), str(self.folder / "link" / "a"))
+        self.assertEqual((list(outside.iterdir()), source.exists()), ([], True))
+
+    def test_odd_names(self):
+        for name in ("ü 日本.txt", " lead space", "semi;colon,comma", "\U0001f600", "a" * 250):
+            move_no_replace(str(self.add(name)), str(self.folder / ("to" + name[:250])))
+            self.assertIn("to" + name[:250], os.listdir(self.folder))
+
+    @linux_only("only Linux allows names that are not valid text or that hold a line break")
     def test_odd_bytes(self):
-        for raw in (b"\xff\xfe.txt", "ü 日本.txt".encode(), b"line\nbreak", b" space "):
+        for raw in (b"\xff\xfe.txt", b"line\nbreak", b" space "):
             name = os.fsdecode(raw)
             move_no_replace(str(self.add(name)), str(self.folder / ("to" + name)))
             self.assertIn(b"to" + raw, os.listdir(os.fsencode(self.folder)))
 
-    @needs_linux
+    @linux_only("renameat2 is Linux only")
     def test_flag_and_bytes_given_to_the_system(self):
         source = self.add("a")
         with mock.patch.object(engine, "_renameat2", return_value=0) as call:
@@ -128,7 +159,7 @@ class Primitive(MoveTest):
         (_, old, _, new, flags), _ = call.call_args
         self.assertEqual((old, new, flags), (b"a", b"b", 1))
 
-    @needs_linux
+    @linux_only("renameat2 is Linux only")
     def test_no_fallback_when_the_system_cant_refuse_to_replace(self):
         source = self.add("a")
         for code in (errno.EINVAL, errno.ENOSYS):
@@ -139,7 +170,7 @@ class Primitive(MoveTest):
                     move_no_replace(str(source), str(self.folder / "b"))
         self.assertEqual(list(self.tree()), ["a"])
 
-    @needs_linux
+    @linux_only("open handles are counted through /proc")
     def test_handles_are_closed(self):
         source = self.add("a")
         before = len(os.listdir("/proc/self/fd"))
@@ -185,16 +216,100 @@ class Windows(unittest.TestCase):
             self.addCleanup(patch.stop)
         self.code = 0
 
+    def fake(self, attributes=0x10, final=None, moves=(1, 1)):
+        """A pretend kernel32: handles are numbers, and each knows the path it was opened with."""
+        opened, closed, left = {}, [], list(moves)
+        final = final or {}
+
+        def create(path, access, sharing, security, how, flags, template):
+            opened[len(opened) + 10] = (path, sharing, flags)
+            return len(opened) + 9
+
+        def information(handle, answer):
+            answer[0] = attributes
+            return 1
+
+        def final_name(handle, text, size, flags):
+            path = opened[handle][0]
+            text.value = final.get(path, "\\\\?\\" + path)
+            return len(text.value)
+
+        self.kernel.CreateFileW.side_effect = create
+        self.kernel.GetFileInformationByHandle.side_effect = information
+        self.kernel.GetFinalPathNameByHandleW.side_effect = final_name
+        self.kernel.MoveFileExW.side_effect = lambda *args: left.pop(0)
+        self.kernel.CloseHandle.side_effect = closed.append
+        return opened, closed
+
     def test_only_write_through(self):
-        self.kernel.MoveFileExW.return_value = 1
-        engine._windows_move("C:\\a", "C:\\b")
-        self.kernel.MoveFileExW.assert_called_once_with("C:\\a", "C:\\b", 8)
+        opened, closed = self.fake()
+        engine._windows_move("C:\\d\\a", "C:\\d\\Images\\a")
+        self.kernel.MoveFileExW.assert_called_once_with("C:\\d\\a", "C:\\d\\Images\\a", 8)
+        self.assertEqual(sorted(closed), sorted(opened))
+
+    def test_folder_is_held_so_it_cant_be_swapped(self):
+        opened, _ = self.fake()
+        engine._windows_move("C:\\d\\a", "C:\\d\\Images\\a")
+        path, sharing, flags = opened[10]
+        self.assertEqual((path, sharing & 4, flags), ("C:\\d\\Images", 0, 0x02200000))
+
+    def test_folder_that_is_a_reparse_point(self):
+        _, closed = self.fake(attributes=0x10 | 0x400)
+        with self.assertRaisesRegex(ActionError, "Images is not a normal folder"):
+            engine._windows_move("C:\\d\\a", "C:\\d\\Images\\a")
+        self.kernel.MoveFileExW.assert_not_called()
+        self.assertEqual(closed, [10])
+
+    def test_folder_that_cant_be_opened(self):
+        self.kernel.CreateFileW.return_value = engine.INVALID_HANDLE
+        self.code = 3
+        with self.assertRaises(FileNotFoundError):
+            engine._windows_move("C:\\d\\a", "C:\\d\\Images\\a")
+        self.kernel.MoveFileExW.assert_not_called()
+
+    def test_landed_somewhere_else_is_put_back(self):
+        self.fake(final={"C:\\d\\Images\\a": "\\\\?\\D:\\elsewhere\\a"})
+        with self.assertRaisesRegex(engine._Misplaced, "It was put back"):
+            engine._windows_move("C:\\d\\a", "C:\\d\\Images\\a")
+        self.assertEqual(self.kernel.MoveFileExW.call_args.args, ("C:\\d\\Images\\a", "C:\\d\\a", 8))
+
+    def test_landed_somewhere_else_and_stuck(self):
+        self.fake(final={"C:\\d\\Images\\a": "\\\\?\\D:\\elsewhere\\a"}, moves=(1, 0))
+        with self.assertRaisesRegex(engine._Misplaced, "Look in: D:\\\\elsewhere\\\\a"):
+            engine._windows_move("C:\\d\\a", "C:\\d\\Images\\a")
+
+    def test_where_it_landed_is_compared_with_the_real_folder(self):
+        real = "\\\\?\\C:\\Users\\Me\\Images"
+        self.fake(final={"S:\\Images": real, "S:\\Images\\a": real + "\\A"})
+        engine._windows_move("S:\\a", "S:\\Images\\a")
+        self.assertEqual(self.kernel.MoveFileExW.call_count, 1)
+
+    def test_unknown_folder_counts_as_elsewhere(self):
+        self.fake()
+        answers = iter([0, 5])
+        self.kernel.GetFinalPathNameByHandleW.side_effect = lambda handle, text, size, flags: next(answers)
+        with self.assertRaises(engine._Misplaced):
+            engine._windows_move("C:\\d\\a", "C:\\d\\Images\\a")
+
+    def test_unknown_landing_counts_as_elsewhere(self):
+        self.fake()
+        self.kernel.GetFinalPathNameByHandleW.side_effect = lambda *args: 0
+        with self.assertRaises(engine._Misplaced):
+            engine._windows_move("C:\\d\\a", "C:\\d\\Images\\a")
+
+    def test_final_path_prefixes(self):
+        unc = ("\\\\?\\UNC\\server\\share\\x", "\\\\server\\share\\x")
+        for given, wanted in (("\\\\?\\C:\\x", "C:\\x"), unc):
+            self.kernel.GetFinalPathNameByHandleW.side_effect = lambda handle, text, size, flags: setattr(
+                text, "value", given
+            ) or len(given)
+            self.assertEqual(engine._final_path(self.kernel, 5), wanted)
 
     def test_failure(self):
-        self.kernel.MoveFileExW.return_value = 0
+        self.fake(moves=(0,))
         self.code = 183
         with self.assertRaises(FileExistsError):
-            engine._windows_move("C:\\a", "C:\\b")
+            engine._windows_move("C:\\d\\a", "C:\\d\\b")
 
     def test_long_paths(self):
         tail = "x" * 300
@@ -218,8 +333,9 @@ class Windows(unittest.TestCase):
 
     def test_the_right_code_is_chosen(self):
         with mock.patch.object(engine.sys, "platform", "win32"), mock.patch.object(engine, "SUPPORTED", True):
-            self.kernel.MoveFileExW.return_value = 1
+            self.fake()
             move_no_replace("C:\\a", "C:\\b")
+            self.kernel.CreateFileW.side_effect = None
             self.kernel.CreateFileW.return_value = 5
             self.assertFalse(in_use("C:\\a"))
             self.assertIsNone(engine._sync("C:\\a"))
@@ -244,11 +360,11 @@ class NotHere(MoveTest):
 
 
 class InUse(MoveTest):
-    @needs_linux
+    @needs_running
     def test_free_file(self):
         self.assertFalse(in_use(str(self.add("a"))))
 
-    @needs_linux
+    @needs_running
     def test_open_for_writing(self):
         path = self.add("a")
         for mode in ("ab", "r+b"):
@@ -256,7 +372,7 @@ class InUse(MoveTest):
                 self.assertTrue(in_use(str(path)))
         self.assertFalse(in_use(str(path)))
 
-    @needs_linux
+    @needs_running
     def test_open_for_writing_by_another_program(self):
         path = self.add("a")
         child = subprocess.Popen(
@@ -270,7 +386,7 @@ class InUse(MoveTest):
             child.communicate()
         self.assertFalse(in_use(str(path)))
 
-    @needs_linux
+    @linux_only("a lease sees a memory map after the file is closed; not checked on Windows")
     def test_still_mapped_by_a_program_that_closed_it(self):
         import mmap
 
@@ -281,45 +397,61 @@ class InUse(MoveTest):
         held.close()
         self.assertFalse(in_use(str(path)))
 
-    @needs_linux
+    @linux_only("Windows counts any open handle, so reading is in use there (tested below)")
     def test_reading_is_fine(self):
         path = self.add("a")
         with path.open("rb"):
             self.assertFalse(in_use(str(path)))
 
-    @needs_linux
+    @unittest.skipUnless(WINDOWS, "Windows only")
+    def test_on_windows_reading_counts_too(self):
+        path = self.add("a")
+        with path.open("rb"):
+            self.assertTrue(in_use(str(path)))
+        self.assertFalse(in_use(str(path)))
+
+    @needs_running
     def test_read_only_file_is_not_in_use(self):
         path = self.add("a")
         path.chmod(0o444)
+        self.addCleanup(path.chmod, 0o644)
         self.assertFalse(in_use(str(path)))
 
-    @needs_linux
+    @linux_only("Windows has no unreadable mode for files")
     @not_root
     def test_unreadable_file_is_unknown(self):
         path = self.add("a")
         path.chmod(0)
         self.assertTrue(in_use(str(path)))
 
-    @needs_linux
-    def test_links_and_missing_files_are_unknown(self):
-        self.add("a")
-        self.symlink("link", self.folder / "a")
-        for name in ("link", "none", "."):
+    @needs_running
+    def test_missing_files_and_folders_are_unknown(self):
+        for name in ("none", "."):
             self.assertTrue(in_use(str(self.folder / name)))
 
-    @needs_linux
+    @linux_only("Windows opens the link itself, which no program writes to")
+    def test_links_are_unknown(self):
+        self.add("a")
+        self.symlink("link", self.folder / "a")
+        self.assertTrue(in_use(str(self.folder / "link")))
+
+    @linux_only("leases are Linux only")
     def test_no_lease_is_unknown(self):
         path = self.add("a")
         for code in (errno.EACCES, errno.EAGAIN, errno.EINVAL):
             with mock.patch.object(engine.fcntl, "fcntl", side_effect=OSError(code, "no")):
                 self.assertTrue(in_use(str(path)))
 
-    @needs_linux
+    @needs_running
     @not_root
     def test_someone_elses_file_is_unknown(self):
-        self.assertTrue(in_use("/etc/hostname" if os.path.exists("/etc/hostname") else "/etc/passwd"))
+        if WINDOWS:
+            place = os.path.join(os.environ.get("SystemRoot", "C:\\Windows"), "System32", "config", "SAM")
+        else:
+            place = "/etc/hostname" if os.path.exists("/etc/hostname") else "/etc/passwd"
+        self.assertTrue(in_use(place))
 
-    @needs_linux
+    @linux_only("leases are Linux only")
     def test_a_broken_lease_cant_end_the_program(self):
         with mock.patch.object(engine.fcntl, "fcntl") as call:
             in_use(str(self.add("a")))
@@ -330,7 +462,7 @@ class InUse(MoveTest):
             (engine.fcntl.F_SETLEASE, engine.fcntl.F_UNLCK),
         ])
 
-    @needs_linux
+    @needs_running
     def test_checking_is_not_reading(self):
         path = self.add("a")
         before = os.stat(path)
@@ -464,7 +596,7 @@ class Apply(MoveTest):
             self.refused(self.tidy(), engine.BUSY)
         self.assertEqual(list(self.tree()), ["a"])
 
-    @needs_linux
+    @needs_moves
     def test_really_in_use(self):
         path = self.add("a")
         moves = self.moves()
@@ -570,7 +702,6 @@ class Apply(MoveTest):
         with mock.patch.object(engine.os.path, "isjunction", return_value=True):
             self.refused(self.tidy(), "Images is not a normal folder.")
 
-    @needs_linux
     def test_folder_swapped_for_a_link_at_the_last_moment(self):
         outside = self.folder.parent / "outside"
         outside.mkdir()
@@ -578,14 +709,13 @@ class Apply(MoveTest):
 
         def swap():
             (self.folder / "Images").rename(self.folder / "Kept")
-            (self.folder / "Images").symlink_to(outside)
+            self.folder_link("Images", outside)
 
         self.at("move planned", swap)
         result = self.tidy()
         self.assertEqual((result.done, len(result.skipped)), ([], 1))
         self.assertEqual((list(outside.iterdir()), path.exists()), ([], True))
 
-    @needs_linux
     def test_folder_swapped_for_a_link_right_after(self):
         outside = self.folder.parent / "outside"
         outside.mkdir()
@@ -593,7 +723,7 @@ class Apply(MoveTest):
 
         def swap():
             (self.folder / "Images").rename(outside / "Images")
-            (self.folder / "Images").symlink_to(outside / "Images")
+            self.folder_link("Images", outside / "Images")
 
         self.at("moved", swap)
         result = self.tidy()
@@ -613,7 +743,7 @@ class Apply(MoveTest):
             self.refused(self.tidy(), engine.OTHER_DISK)
         self.assertTrue(path.exists())
 
-    @needs_linux
+    @linux_only("Windows ignores the read-only mark on folders")
     @not_root
     def test_read_only_folder(self):
         folder = self.folder / "Images"
@@ -627,7 +757,7 @@ class Apply(MoveTest):
         self.assertEqual(result.skipped[0].why, "Downkeep isn't allowed to move it.")
         self.assertEqual(self.states(result.batch)[0], ("move", "a", "ABORTED"))
 
-    @needs_linux
+    @linux_only("Windows ignores the read-only mark on folders")
     @not_root
     def test_read_only_downloads_folder(self):
         self.add("a")
@@ -638,20 +768,100 @@ class Apply(MoveTest):
         self.refused(result, "Downkeep isn't allowed to move it.")
         self.assertEqual(self.states(result.batch)[0], ("mkdir", "Images", "ABORTED"))
 
-    @needs_linux
     def test_read_only_file(self):
-        self.add("a", b"one").chmod(0o444)
-        self.assertEqual(self.tidy().done, ["a"])
+        path = self.add("a", b"one")
+        path.chmod(0o444)
+        batch = self.tidy().batch
+        moved = self.folder / "Images" / "a"
+        self.addCleanup(lambda: [place.chmod(0o644) for place in (path, moved) if place.exists()])
+        self.assertTrue(moved.exists())
+        self.assertEqual(undo(self.store, batch).done, ["a"])
+        self.assertFalse(os.access(path, os.W_OK))
 
-    @needs_linux
     def test_odd_names(self):
-        raw = ["ü 日本.txt", "line\nbreak.txt", " spaces ", os.fsdecode(b"\xff\xfe.bin"), "'; DROP TABLE x; --", "-rf"]
+        self.odd_names(["ü 日本.txt", " lead space", "\U0001f600 x", "'; DROP TABLE x; --", "-rf", "a" * 250])
+
+    @linux_only("only Linux allows names that are not valid text, line breaks or a space at the end")
+    def test_names_only_linux_allows(self):
+        self.odd_names(["line\nbreak.txt", " spaces ", os.fsdecode(b"\xff\xfe.bin"), "a\\b:c*?.txt"])
+
+    @unittest.skipUnless(WINDOWS and engine.SUPPORTED, "only Windows rewrites names that end with a dot or space")
+    def test_names_windows_rewrites_stay(self):
+        for name in ("ends with dot.", "ends with space "):
+            exact = "\\\\?\\" + str(self.folder / name)
+            with open(exact, "wb") as stream:
+                stream.write(b"x")
+            os.utime(exact, (1, 1))
+            info = os.stat(exact)
+            file = FileRecord(name, str(self.folder / name), 1, info.st_mtime_ns, info.st_dev, info.st_ino, 1)
+            result = self.tidy([Move(file, "Images", "")])
+            self.assertEqual(result.done, [])
+            self.assertTrue(os.path.exists(exact))
+            os.unlink(exact)
+
+    def test_long_paths(self):
+        deep = self.folder.parent / ("x" * 120) / ("y" * 120) / "Downloads"
+        try:
+            deep.mkdir(parents=True)
+        except OSError:
+            self.skipTest("long paths are turned off on this computer")
+        self.folder = deep
+        path = self.add("a" * 40, b"one")
+        batch = self.tidy().batch
+        self.assertTrue((deep / "Images" / path.name).exists())
+        self.assertEqual(undo(self.store, batch).done, [path.name])
+        self.assertEqual(path.read_bytes(), b"one")
+
+    def odd_names(self, raw):
         for name in raw:
             self.add(name, name.encode("utf-8", "surrogateescape"))
         result = self.tidy()
         self.assertEqual((sorted(result.done), result.skipped), (sorted(raw), []))
         undo(self.store, result.batch)
         self.assertEqual({name: name.encode("utf-8", "surrogateescape") for name in raw}, self.tree())
+
+    def test_stops_when_asked(self):
+        for name in "abc":
+            self.add(name)
+        asked = iter([False, True])
+        result = apply_moves(self.store, str(self.folder), self.moves(), "auto", should_stop=lambda: next(asked))
+        self.assertEqual(result.done, ["a"])
+        stopped = [("b", engine.STOPPED), ("c", engine.STOPPED)]
+        self.assertEqual([(stay.name, stay.why) for stay in result.skipped], stopped)
+        self.assertEqual([item["name"] for item in self.store.history()[0]["left"]], ["b", "c"])
+        self.assertEqual(sorted(self.tree()), ["Images", os.path.join("Images", "a"), "b", "c"])
+
+    def test_stopped_before_anything(self):
+        self.add("a")
+        result = apply_moves(self.store, str(self.folder), self.moves(), should_stop=lambda: True)
+        self.refused(result, engine.STOPPED)
+        self.assertEqual(list(self.tree()), ["a"])
+
+    def test_a_different_file_moved_at_the_last_instant_can_be_put_back(self):
+        self.add("a", b"one")
+        real = engine.move_no_replace
+
+        def replace_then_move(source, dest):
+            os.rename(source, source + ".orig")
+            self.add("a", b"someone else's")
+            real(source, dest)
+
+        with mock.patch.object(engine, "move_no_replace", replace_then_move):
+            result = self.tidy()
+        self.refused(result, "A different file was moved to " + os.path.join("Images", "a") + "; look there.")
+        (op,) = [op for op in self.store.operations(result.batch) if op.action == "move"]
+        self.assertEqual((op.state, op.other_file), ("CONFLICT", True))
+        self.assertTrue(self.store.history()[0]["can_undo"])
+        self.assertEqual(undo(self.store, result.batch).done, ["a"])
+        self.assertEqual(self.tree(), {"a": b"someone else's", "a.orig": b"one"})
+        self.assertFalse(self.store.history()[1]["can_undo"])
+
+    def test_a_move_windows_put_somewhere_else_is_a_conflict(self):
+        self.add("a")
+        with mock.patch.object(engine, "move_no_replace", side_effect=engine._Misplaced("It was put back.")):
+            result = self.tidy()
+        self.refused(result, "It was put back.")
+        self.assertEqual(self.states(result.batch)[1], ("move", "a", "CONFLICT"))
 
     def test_same_file_twice_in_one_plan(self):
         self.add("a")
@@ -727,7 +937,7 @@ class Apply(MoveTest):
         self.assertEqual(recover(self.store).done, ["a"])
         self.assertEqual(self.states(result.batch), [("move", "a", "DONE")])
 
-    @needs_linux
+    @linux_only("Windows has no folder flush; moves use MOVEFILE_WRITE_THROUGH instead")
     def test_both_folders_are_flushed_before_done(self):
         self.add("a")
         steps = []
@@ -743,7 +953,7 @@ class Apply(MoveTest):
             str(self.folder), "DONE", str(self.folder / "Images"), str(self.folder), "DONE",
         ])
 
-    @needs_linux
+    @linux_only("Windows has no folder flush; moves use MOVEFILE_WRITE_THROUGH instead")
     def test_a_flush_that_fails_is_not_done(self):
         (self.folder / "Images").mkdir()
         self.add("a")
@@ -753,7 +963,7 @@ class Apply(MoveTest):
             self.assertEqual(recover(self.store).done, [])
         self.assertEqual(recover(self.store).done, ["a"])
 
-    @needs_linux
+    @linux_only("Windows has no folder flush; moves use MOVEFILE_WRITE_THROUGH instead")
     def test_flush_is_real(self):
         with mock.patch.object(engine.os, "fsync") as call:
             engine._sync(str(self.folder))
@@ -1080,6 +1290,85 @@ class Undo(MoveTest):
         self.assertEqual(result.done, ["a"])
         self.assertEqual([stay.why for stay in result.skipped], ["A different file is there now."])
 
+    def test_only_some_names(self):
+        for name in "abc":
+            self.add(name)
+        batch = self.tidy().batch
+        self.assertEqual(undo(self.store, batch, names=["b"]).done, ["b"])
+        self.assertEqual(sorted(self.tree()), ["Images", os.path.join("Images", "a"), os.path.join("Images", "c"), "b"])
+        run = next(run for run in self.store.history() if run["batch"] == batch)
+        self.assertEqual((run["undone"], run["can_undo"]), (False, True))
+        with self.assertRaisesRegex(ActionError, "already back"):
+            undo(self.store, batch, names=["b", "none"])
+        self.assertEqual(undo(self.store, batch, names=["a", "c"]).done, ["c", "a"])
+        self.assertEqual(sorted(self.tree()), ["a", "b", "c"])
+        run = next(run for run in self.store.history() if run["batch"] == batch)
+        self.assertEqual((run["undone"], run["can_undo"]), (True, False))
+
+    def test_a_new_file_with_the_old_number_is_not_put_back(self):
+        self.add("a", b"one")
+        batch = self.tidy().batch
+        started = self.store.batch(batch).started_ns
+        moved = self.folder / "Images" / "a"
+        moved.write_bytes(b"something else entirely")
+        for born, done in ((started + 10**9, []), (None, ["a"])):
+            with mock.patch.object(engine, "_born_ns", return_value=born):
+                result = undo(self.store, batch)
+            self.assertEqual(result.done, done)
+            if not done:
+                self.assertEqual([stay.why for stay in result.skipped], [engine.DIFFERENT])
+
+    def test_an_old_file_edited_is_put_back(self):
+        self.add("a", b"one")
+        batch = self.tidy().batch
+        (self.folder / "Images" / "a").write_bytes(b"one, edited")
+        with mock.patch.object(engine, "_born_ns", return_value=self.store.batch(batch).started_ns - 10**9):
+            self.assertEqual(undo(self.store, batch).done, ["a"])
+
+    def test_only_the_size_changed_is_an_edit(self):
+        path = self.add("a", b"one")
+        batch = self.tidy().batch
+        moved = self.folder / "Images" / "a"
+        when = moved.stat().st_mtime_ns
+        moved.write_bytes(b"two!")
+        os.utime(moved, ns=(when, when))
+        with mock.patch.object(engine, "_born_ns", return_value=self.store.batch(batch).started_ns + 10**9):
+            self.assertEqual(undo(self.store, batch).done, ["a"])
+        self.assertEqual(path.read_bytes(), b"two!")
+
+    def test_birth_time(self):
+        before = time.time_ns()
+        born = engine._born_ns(str(self.add("a")))
+        if born is not None:
+            self.assertLess(abs(born - before), 5 * 10**9)
+        self.assertIsNone(engine._born_ns(str(self.folder / "none")))
+
+    def test_a_folder_born_again_is_not_removed(self):
+        self.add("a")
+        batch = self.tidy().batch
+        self.store._run("UPDATE operations SET mtime_ns = mtime_ns + 1 WHERE action = 'mkdir'")
+        if self.store.operations(batch)[0].identity.mtime_ns == 1:
+            self.skipTest("this disk keeps no birth time")
+        undo(self.store, batch)
+        self.assertEqual(self.tree(), {"a": b"x", "Images": None})
+
+    def test_a_folder_identity_is_its_birth(self):
+        self.add("a")
+        batch = self.tidy().batch
+        folder = self.store.operations(batch)[0].identity
+        info = (self.folder / "Images").stat()
+        self.assertEqual((folder.inode, folder.size), (info.st_ino, 0))
+        self.assertEqual(folder.mtime_ns, engine._born_ns(str(self.folder / "Images")) or 0)
+
+    def test_the_name_is_kept_with_left_files(self):
+        self.add("a")
+        batch = self.tidy(kind="auto").batch
+        undo(self.store, batch)
+        self.assertEqual(self.store._run("SELECT name FROM seen"), [(b"a",)])
+        (file,) = scan(self.folder).files
+        stranger = FileRecord("b", file.path, 1, file.mtime_ns + 5, file.device, file.inode, 1)
+        self.assertFalse(self.store.is_left(stranger))
+
     def test_tidy_undo_tidy_undo(self):
         self.add("a", b"one")
         for _ in range(3):
@@ -1149,6 +1438,22 @@ class UndoTrash(MoveTest):
         self.refused(undo(self.store, batch), "Downloads already has that name.")
         self.assertEqual((self.bin / "a").read_bytes(), b"x")
 
+    def test_name_taken_in_another_case(self):
+        batch, _ = self.send("a")
+        self.add("A", b"mine")
+        self.refused(undo(self.store, batch), "Downloads already has that name.")
+        self.assertEqual(self.calls, [])
+
+    def test_in_use(self):
+        batch, _ = self.send("a")
+        with mock.patch.object(engine, "in_use", return_value=True):
+            self.refused(undo(self.store, batch), engine.BUSY)
+        self.assertEqual(self.calls, [])
+
+    def test_only_some_names(self):
+        first, _ = self.send("a")
+        self.assertEqual(undo(self.store, first, names=["a"]).done, ["a"])
+
     def test_a_reason_from_the_trash(self):
         batch, _ = self.send("a")
         self.trash.restore = mock.Mock(side_effect=ActionError("Its note is missing."))
@@ -1201,7 +1506,8 @@ class Recover(MoveTest):
         source.rename(dest)
         with mock.patch.object(engine, "_sync") as sync:
             self.settled(batch, "DONE", done=["a"])
-        self.assertEqual([call.args[0] for call in sync.call_args_list], [str(self.folder / "Images"), str(self.folder)])
+        flushed = [call.args[0] for call in sync.call_args_list]
+        self.assertEqual(flushed, [str(self.folder / "Images"), str(self.folder)])
         self.assertEqual(undo(self.store, batch).done, ["a"])
 
     def test_after_the_move_with_a_new_file_in_the_old_place(self):
@@ -1214,6 +1520,7 @@ class Recover(MoveTest):
         batch, source, dest = self.planned()
         os.link(source, dest)
         result = self.settled(batch, "CONFLICT")
+        self.assertFalse(self.store.operations(batch)[0].other_file)
         for path in (source, dest):
             self.assertIn(str(path), result.skipped[0].why)
 
@@ -1222,6 +1529,27 @@ class Recover(MoveTest):
         source.unlink()
         result = self.settled(batch, "CONFLICT")
         self.assertIn(str(source), result.skipped[0].why)
+
+    def test_a_different_file_at_the_destination_can_be_put_back(self):
+        batch, source, dest = self.planned()
+        os.rename(source, self.folder / "kept")
+        dest.write_bytes(b"other")
+        result = self.settled(batch, "CONFLICT")
+        self.assertIn("A different file was moved to", result.skipped[0].why)
+        self.assertTrue(self.store.operations(batch)[0].other_file)
+        self.assertEqual(undo(self.store, batch).done, ["a"])
+        self.assertEqual(source.read_bytes(), b"other")
+
+    def test_only_a_plain_file_at_the_destination_can_be_put_back(self):
+        for make in (lambda dest: dest.mkdir(), lambda dest: os.link(self.add("twin", b"two"), dest)):
+            batch, source, dest = self.planned()
+            os.rename(source, self.folder / "kept")
+            make(dest)
+            self.settled(batch, "CONFLICT", names=("a",))
+            self.assertFalse(self.store.operations(batch)[0].other_file)
+            (dest.rmdir if dest.is_dir() else dest.unlink)()
+            for name in ("kept", "twin"):
+                (self.folder / name).unlink(missing_ok=True)
 
     def test_edited_after_the_move(self):
         batch, source, dest = self.planned()
