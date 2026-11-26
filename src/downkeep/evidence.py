@@ -1,5 +1,6 @@
 import hashlib
 import os
+import re
 import stat
 import struct
 import zipfile
@@ -7,10 +8,10 @@ import zlib
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import PurePosixPath
 
-from downkeep.scan import FileRecord
+from downkeep.scan import FileRecord, ScanError, scan
 
 HEAD = 65_536
 BLOCK = 1024 * 1024
@@ -20,6 +21,9 @@ MAX_INDEX = 200_000
 MAX_CANDIDATES = 20
 EXAMPLES = 3
 NEVER_ENTER = {".git", ".hg", ".venv", "__pycache__", "node_modules", "venv"}
+STORED, DEFLATED = 0, 8
+# "a (1).pdf", "a - Copy.pdf", "a copy 2.pdf", "a (another copy).pdf", "Copy of a.pdf"
+COPY_NAME = re.compile(r"^copy of |\s\(\d+\)$|(\s-)?\s\(?((\d+(st|nd|rd|th)|another)\s)?copy(\s\d+)?\)?(\s\(\d+\))?$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,12 +47,46 @@ class Changed(Exception):
     pass
 
 
-def find_duplicates(files: Iterable[FileRecord]) -> list[Duplicates]:
-    groups = _same(_one_per_inode(files), lambda file: file.size)
+def find_duplicates(files: Iterable[FileRecord], keepers: Iterable[FileRecord] = ()) -> list[Duplicates]:
+    """Groups of identical files, the one that stays first. Keepers (from subfolders) can only stay."""
+    groups = _same(_one_per_inode([*keepers, *files]), lambda file: file.size)
     groups = [smaller for group in groups for smaller in _same(group, lambda file: _hash(file, HEAD))]
     groups = [same for group in groups for same in _same(group, _hash)]
-    found = [Duplicates(tuple(sorted(group, key=lambda file: (file.mtime_ns, file.name)))) for group in groups]
+    found = []
+    for group in groups:
+        group = sorted(group, key=_keep_first)
+        group = group[:1] + [file for file in group[1:] if "/" not in file.name]
+        if len(group) > 1:
+            found.append(Duplicates(tuple(group)))
     return sorted(found, key=lambda group: (-group.wasted, group.files[0].name))
+
+
+def find_keepers(folder: str, names: Iterable[str]) -> list[FileRecord]:
+    """Files directly inside these subfolders, named "Documents/a.pdf". Links and other disks are left out."""
+    found = []
+    device = os.stat(folder).st_dev
+    for name in dict.fromkeys(name for name in names if isinstance(name, str)):
+        if name in ("", ".", "..") or set(name) & {"/", "\\", "\0"} or is_trash(name):
+            continue
+        path = os.path.join(folder, name)
+        try:
+            info = os.lstat(path)
+            if not stat.S_ISDIR(info.st_mode) or os.path.realpath(path) != path or info.st_dev != device:
+                continue
+            files = scan(path).files
+        except (OSError, ScanError):
+            continue
+        found += [replace(file, name=f"{name}/{file.name}") for file in files if file.device == device]
+    return found
+
+
+def is_copy_name(name: str) -> bool:
+    stem = os.path.splitext(os.path.basename(name))[0].lower()
+    return bool(COPY_NAME.search(stem.removesuffix(".tar")))
+
+
+def _keep_first(file):
+    return "/" not in file.name, is_copy_name(file.name), file.mtime_ns, file.name
 
 
 def find_extracted(files: Iterable[FileRecord], folder: str) -> list[Extracted]:
@@ -62,7 +100,7 @@ def find_extracted(files: Iterable[FileRecord], folder: str) -> list[Extracted]:
     found = []
     for archive in archives:
         members = _members(archive)
-        where = _find_folder(members, sizes, by_name) if members else None
+        where = _find_folder(archive, members, sizes, by_name) if members else None
         if where:
             examples = tuple(parts[-1] for parts in sorted(members)[:EXAMPLES])
             found.append(Extracted(archive, where, len(members), examples))
@@ -83,7 +121,9 @@ def verify_extracted(item: Extracted) -> tuple[str, ...]:
     # A link anywhere on the way would make a file outside the folder count as proof
     if any(os.path.realpath(place) != place for place in wanted):
         return ()
-    return tuple(wanted) if all(_checksum(place, size) == crc for place, (size, crc) in wanted.items()) else ()
+    if not all(_checksum(place, size) == crc for place, (size, crc) in wanted.items()):
+        return ()
+    return tuple(wanted) if _same_contents(item.archive, item.folder) else ()
 
 
 def is_trash(name: str) -> bool:
@@ -208,7 +248,7 @@ def _index(folder):
     return sizes
 
 
-def _find_folder(members, sizes, by_name):
+def _find_folder(archive, members, sizes, by_name):
     largest = max(members, key=lambda parts: (members[parts][0], parts))
     size, _ = members[largest]
     tail = os.path.join(*largest)
@@ -219,7 +259,8 @@ def _find_folder(members, sizes, by_name):
         wanted = {os.path.join(folder, *parts): value for parts, value in members.items()}
         if any(sizes.get(place) != value[0] for place, value in wanted.items()):
             continue
-        if all(_checksum(place, value[0]) == value[1] for place, value in wanted.items()):
+        same = all(_checksum(place, value[0]) == value[1] for place, value in wanted.items())
+        if same and _same_contents(archive, folder):
             return folder
     return None
 
@@ -241,5 +282,77 @@ def _checksum(path, size):
         return value if same else None
     except OSError:
         return None
+    finally:
+        os.close(descriptor)
+
+
+def _same_contents(archive, folder):
+    """Unpacks each file in memory, a block at a time, and compares it with the one on disk.
+
+    A checksum alone can be matched on purpose. Every packed byte must be used and the output may not pass
+    the declared size, which already equals the file on disk, so neither hidden data nor a zip bomb gets through.
+    """
+    try:
+        with _open(archive) as descriptor, open(descriptor, "rb", closefd=False) as stream:
+            with zipfile.ZipFile(stream) as opened:
+                entries = [entry for entry in opened.infolist() if not entry.is_dir()]
+            for entry in entries:
+                place = os.path.join(folder, *PurePosixPath(entry.orig_filename).parts)
+                if entry.filename.startswith("__MACOSX/"):
+                    continue
+                if _unpacked(stream, entry) != _digest(place, entry.file_size):
+                    return False
+        return True
+    except (Changed, OSError, ValueError, EOFError, zlib.error, struct.error, zipfile.BadZipFile):
+        return False
+
+
+def _unpacked(stream, entry):
+    """The digest of one member's contents, or None if it holds more or less than it says."""
+    if entry.compress_type not in (STORED, DEFLATED):
+        return None
+    stream.seek(entry.header_offset)
+    header = stream.read(30)
+    if len(header) < 30 or header[:4] != b"PK\x03\x04":
+        return None
+    stream.seek(sum(struct.unpack_from("<HH", header, 26)), os.SEEK_CUR)
+    unpack = zlib.decompressobj(-15) if entry.compress_type == DEFLATED else None
+    digest, out, left = hashlib.blake2b(digest_size=32), 0, entry.compress_size
+    while True:
+        if unpack and unpack.unconsumed_tail:
+            packed = unpack.unconsumed_tail
+        elif left:
+            packed = stream.read(min(BLOCK, left))
+            left -= len(packed)
+            if not packed:
+                return None
+        elif unpack and not unpack.eof:
+            packed = b""
+        else:
+            break
+        block = unpack.decompress(packed, BLOCK) if unpack else packed
+        if not (packed or block):
+            break
+        out += len(block)
+        if out > entry.file_size:
+            return None
+        digest.update(block)
+    finished = unpack is None or (unpack.eof and not unpack.unused_data)
+    return digest.digest() if finished else None
+
+
+def _digest(place, size):
+    descriptor = _open_quietly(place)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size != size:
+            raise Changed(place)
+        digest = hashlib.blake2b(digest_size=32)
+        for block in _blocks(descriptor):
+            digest.update(block)
+        after = os.fstat(descriptor)
+        if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+            raise Changed(place)
+        return digest.digest()
     finally:
         os.close(descriptor)

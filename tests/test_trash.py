@@ -424,6 +424,42 @@ class LinuxTest(FolderTest):
         trash.restore(str(path), place, identity)
         self.assertEqual((path.read_bytes(), self.notes()), (b"one", ["a.txt.trashinfo"]))
 
+    def test_notes_left_by_a_crash(self):
+        path = self.add("a b.txt", b"one")
+        self.send(self.add("kept.txt", b"two"))
+        mine = f"[Trash Info]\nPath={self.folder}/a%20b.txt\nDeletionDate=2026-01-01T00:00:00\n"
+        (self.info / "a b.txt.trashinfo").write_text(mine)
+        (self.info / "a b 2.txt.trashinfo").write_text(mine)
+        (self.files / "a b 2.txt").write_bytes(b"someone put it back")
+        (self.info / "other.txt.trashinfo").write_text(mine.replace("a%20b", "other"))
+        (self.info / "kept.txt.trashinfo.bak").write_text(mine)
+        trash.drop_notes(str(path))
+        trash.drop_notes(str(path))
+        self.assertEqual(self.notes(), ["a b 2.txt.trashinfo", "kept.txt.trashinfo", "kept.txt.trashinfo.bak",
+                                        "other.txt.trashinfo"])
+        self.assertEqual(path.read_bytes(), b"one")
+        with mock.patch("downkeep.trash.LINUX", False):
+            trash.drop_notes(str(self.folder / "other.txt"))
+        self.assertIn("other.txt.trashinfo", self.notes())
+
+    @unittest.skipUnless(engine and engine.SUPPORTED, "needs the engine")
+    def test_recovery_drops_the_note_of_a_move_that_never_happened(self):
+        from downkeep.store import Store
+
+        path = self.add("a b.txt", b"one")
+        self.send(self.add("kept.txt", b"two"))
+        (self.info / "a b.txt.trashinfo").write_text(f"[Trash Info]\nPath={self.folder}/a%20b.txt\n")
+        with Store(self.folder.parent / "store") as store:
+            store.intent(store.begin("trash", str(self.folder)), "trash", str(path), None, identity_of(path))
+            with mock.patch("downkeep.trash.drop_notes", side_effect=PermissionError("no")):
+                engine._recover(store)
+            self.assertEqual(store.open_intents(), [])
+            self.assertIn("a b.txt.trashinfo", self.notes())
+            store.intent(store.begin("trash", str(self.folder)), "trash", str(path), None, identity_of(path))
+            engine._recover(store)
+            self.assertEqual(store.open_intents(), [])
+        self.assertEqual((path.read_bytes(), self.notes()), (b"one", ["kept.txt.trashinfo"]))
+
     def test_find(self):
         path = self.add("a.txt", b"one")
         identity = identity_of(path)

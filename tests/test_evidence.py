@@ -1,13 +1,17 @@
+import hashlib
+import io
 import os
+import time
 import stat
 import struct
 import unittest
 import zipfile
+import zlib
 from dataclasses import replace
 from unittest import mock
 
 from downkeep import evidence
-from downkeep.evidence import find_duplicates, find_extracted
+from downkeep.evidence import find_duplicates, find_extracted, find_keepers, is_copy_name, verify_extracted
 from downkeep.scan import scan
 from tests.helpers import FolderTest
 
@@ -341,10 +345,288 @@ class ExtractedTest(FolderTest):
         self.zip()
         self.extract("pack")
         before = sorted(str(path) for path in self.folder.rglob("*"))
-        with mock.patch("zipfile.ZipFile.open", side_effect=AssertionError("extracted")):
+        with mock.patch("zipfile.ZipFile.extract", side_effect=AssertionError("extracted")), \
+                mock.patch("zipfile.ZipFile.extractall", side_effect=AssertionError("extracted")):
             self.assertEqual(len(self.found()), 1)
         self.assertEqual(sorted(str(path) for path in self.folder.rglob("*")), before)
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def forge(data, target, at=0):
+    """Flips bits so the checksum becomes target: CRC32 is linear, so this is easy on purpose."""
+    base, basis = zlib.crc32(data), {}
+    for bit in range(64):
+        flipped = bytearray(data)
+        flipped[at + bit // 8] ^= 1 << (bit % 8)
+        vector, mask = zlib.crc32(flipped) ^ base, 1 << bit
+        for high in reversed(range(32)):
+            if vector >> high & 1:
+                if high not in basis:
+                    basis[high] = vector, mask
+                    break
+                vector, mask = vector ^ basis[high][0], mask ^ basis[high][1]
+    want, mask = base ^ target, 0
+    for high in reversed(range(32)):
+        if want >> high & 1:
+            want, mask = want ^ basis[high][0], mask ^ basis[high][1]
+    out = bytearray(data)
+    for bit in range(64):
+        if mask >> bit & 1:
+            out[at + bit // 8] ^= 1 << (bit % 8)
+    return bytes(out)
+
+
+def lie(data, size, crc):
+    """Rewrites the size and checksum a zip declares for its only file."""
+    data = bytearray(data)
+    struct.pack_into("<L", data, 14, crc)
+    struct.pack_into("<L", data, 22, size)
+    central = data.rfind(b"PK\x01\x02")
+    struct.pack_into("<L", data, central + 16, crc)
+    struct.pack_into("<L", data, central + 24, size)
+    return bytes(data)
+
+
+class ContentsTest(FolderTest):
+    extract = ExtractedTest.extract
+    found = ExtractedTest.found
+
+    def place(self, data, member="d/a.txt", on_disk=b"one"):
+        (self.folder / "pack.zip").write_bytes(data)
+        when = time.time() - 10 * 86_400
+        os.utime(self.folder / "pack.zip", (when, when))
+        self.extract(files={member: on_disk})
+
+    def packed(self, content, kind=zipfile.ZIP_DEFLATED):
+        stream = io.BytesIO()
+        with zipfile.ZipFile(stream, "w", kind) as archive:
+            archive.writestr("d/a.txt", content)
+        return stream.getvalue()
+
+    def test_same_size_and_checksum_is_not_enough(self):
+        real = b"Only copy of my thesis, chapter 1. " * 30
+        fake = forge(b"X" * len(real), zlib.crc32(real), 100)
+        self.assertEqual((len(fake), zlib.crc32(fake)), (len(real), zlib.crc32(real)))
+        for kind in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+            with self.subTest(kind):
+                self.place(self.packed(real, kind), on_disk=fake)
+                self.assertEqual(self.found(), [])
+                self.place(self.packed(real, kind), on_disk=real)
+                (item,) = self.found()
+                self.assertEqual(verify_extracted(item), (str(self.folder / "d" / "a.txt"),))
+                (self.folder / "d" / "a.txt").write_bytes(fake)
+                self.assertEqual(verify_extracted(item), ())
+
+    def test_hidden_data_after_the_declared_size(self):
+        for kind in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+            with self.subTest(kind):
+                self.place(lie(self.packed(b"one and a secret", kind), 3, zlib.crc32(b"one")))
+                self.assertEqual(self.found(), [])
+
+    def test_less_data_than_declared(self):
+        self.place(lie(self.packed(b"on"), 3, zlib.crc32(b"one")))
+        self.assertEqual(self.found(), [])
+
+    def test_a_zip_bomb_stops_at_the_declared_size(self):
+        self.place(lie(self.packed(bytes(200 * 1024 * 1024)), 10, zlib.crc32(bytes(10))), on_disk=bytes(10))
+        started = time.monotonic()
+        with mock.patch("downkeep.evidence.BLOCK", 4096):
+            self.assertEqual(self.found(), [])
+        self.assertLess(time.monotonic() - started, 2)
+
+    def test_other_ways_of_packing_are_not_proof(self):
+        self.place(self.packed(b"one", zipfile.ZIP_BZIP2))
+        self.assertEqual(self.found(), [])
+        self.place(self.packed(b"one"))
+        self.assertEqual(len(self.found()), 1)
+
+    def test_big_files_in_small_blocks(self):
+        content = os.urandom(300_000) * 3
+        self.place(self.packed(content), on_disk=content)
+        with mock.patch("downkeep.evidence.BLOCK", 1000):
+            self.assertEqual(len(self.found()), 1)
+            (self.folder / "d" / "a.txt").write_bytes(content[:-1] + b"x")
+            self.assertEqual(self.found(), [])
+
+    def test_an_extracted_file_that_changes_while_it_is_read(self):
+        path = self.add("a.txt", b"one")
+        self.assertEqual(evidence._digest(str(path), 3), hashlib.blake2b(b"one", digest_size=32).digest())
+        real = evidence._blocks
+
+        def edit(descriptor, limit=None):
+            yield from real(descriptor, limit)
+            os.utime(path, (1, 1))
+
+        for size, blocks in ((3, edit), (4, real)):
+            with mock.patch("downkeep.evidence._blocks", blocks), self.assertRaises(evidence.Changed):
+                evidence._digest(str(path), size)
+
+    def stored(self, content):
+        stream = io.BytesIO()
+        with zipfile.ZipFile(stream, "w") as archive:
+            archive.writestr("d/a.txt", content)
+        return bytearray(stream.getvalue())
+
+    def test_an_unknown_way_of_packing_is_not_proof(self):
+        data = self.stored(b"one")
+        for offset in (8, data.rfind(b"PK\x01\x02") + 10):
+            struct.pack_into("<H", data, offset, 99)
+        self.place(bytes(data))
+        self.assertEqual(self.found(), [])
+
+    def test_a_broken_local_header(self):
+        data = self.stored(b"one")
+        data[0:2] = b"XX"
+        self.place(bytes(data))
+        self.assertEqual(self.found(), [])
+
+    def resize(self, data, packed):
+        """Gives the only file a new packed size: data hidden after its end, or a cut-off stream."""
+        central = data.rfind(b"PK\x01\x02")
+        start = 30 + sum(struct.unpack_from("<HH", data, 26))
+        old = struct.unpack_from("<L", data, 18)[0]
+        body = bytes(data[:start]) + packed + bytes(data[start + old:])
+        body = bytearray(body)
+        struct.pack_into("<L", body, 18, len(packed))
+        central += len(packed) - old
+        struct.pack_into("<L", body, central + 20, len(packed))
+        end = body.rfind(b"PK\x05\x06")
+        struct.pack_into("<L", body, end + 16, central)
+        return bytes(body)
+
+    def test_data_hidden_after_the_packed_stream(self):
+        data = bytearray(self.packed(b"one"))
+        start = 30 + sum(struct.unpack_from("<HH", data, 26))
+        packed = bytes(data[start:start + struct.unpack_from("<L", data, 18)[0]])
+        self.place(self.resize(data, packed + b"secret"))
+        self.assertEqual(self.found(), [])
+        self.place(self.resize(data, packed[:-2]))
+        self.assertEqual(self.found(), [])
+        self.place(self.resize(data, packed))
+        self.assertEqual(len(self.found()), 1)
+
+    def test_unpacking_uses_little_memory(self):
+        import tracemalloc
+
+        self.place(lie(self.packed(bytes(100 * 1024 * 1024)), 10, zlib.crc32(bytes(10))), on_disk=bytes(10))
+        real, out = zlib.decompressobj, []
+
+        class Counted:
+            def __init__(self, *args):
+                self.inner = real(*args)
+
+            def __getattr__(self, name):
+                return getattr(self.inner, name)
+
+            def decompress(self, *args):
+                block = self.inner.decompress(*args)
+                out.append(len(block))
+                return block
+
+        tracemalloc.start()
+        try:
+            with mock.patch.object(evidence.zlib, "decompressobj", Counted):
+                self.assertEqual(self.found(), [])
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 40 * 1024 * 1024)
+        self.assertLessEqual(sum(out), evidence.BLOCK)
+
+
+class KeepersTest(FolderTest):
+    def keep_in(self, *names):
+        return find_keepers(str(self.folder), names)
+
+    def groups(self, *names):
+        files = scan(self.folder).files
+        return [[file.name for file in group.files] for group in find_duplicates(files, self.keep_in(*names))]
+
+    def test_copy_names(self):
+        for name in ("a (1).pdf", "a (12).tar.gz", "Copy of a.pdf", "a - Copy.pdf", "a - Copy (2).pdf", "a copy.pdf",
+                     "a copy 2.pdf", "a (copy).pdf", "a (another copy).pdf", "a (3rd copy).pdf", "Documents/a (1).pdf"):
+            self.assertTrue(is_copy_name(name), name)
+        for name in ("a.pdf", "copy.pdf", "a1.pdf", "report 2025.pdf", "a(1)b.pdf", "copyright.pdf", "Copy of"):
+            self.assertFalse(is_copy_name(name), name)
+
+    def test_the_original_name_stays_even_if_newer(self):
+        self.add("cv (1).pdf", b"same", days=9)
+        self.add("Copy of cv.pdf", b"same", days=8)
+        self.add("cv.pdf", b"same", days=1)
+        self.assertEqual(self.groups(), [["cv.pdf", "cv (1).pdf", "Copy of cv.pdf"]])
+
+    def test_a_tidied_original_stays(self):
+        self.add("cv.pdf", b"same", days=1)
+        (self.folder / "Documents").mkdir()
+        self.add("Documents/cv (1).pdf", b"same", days=9)
+        self.add("Documents/cv.pdf", b"same", days=5)
+        self.assertEqual(self.groups(), [])
+        self.assertEqual(self.groups("Documents"), [["Documents/cv.pdf", "cv.pdf"]])
+
+    def test_copies_inside_subfolders_are_never_the_extra_one(self):
+        for name in ("Documents", "Other"):
+            (self.folder / name).mkdir()
+            self.add(f"{name}/a.txt", b"same")
+        self.add("Documents/b.txt", b"same")
+        self.assertEqual(self.groups("Documents", "Other"), [])
+        self.add("a.txt", b"same")
+        self.assertEqual(len(self.groups("Documents", "Other")[0]), 2)
+
+    def test_only_real_subfolders_on_the_same_disk(self):
+        (self.folder / "Documents").mkdir()
+        self.add("Documents/a.txt", b"same")
+        (self.folder / "Documents" / "deeper").mkdir()
+        self.add("Documents/deeper/b.txt", b"other")
+        self.add("Documents/.hidden", b"same")
+        self.symlink("Linked", self.folder / "Documents")
+        (self.folder / ".Trash-1000").mkdir()
+        self.add(".Trash-1000/a.txt", b"same")
+        for name in ("Linked", "Documents/deeper", "..", ".", "", "missing", "/", ".Trash-1000", 7, None):
+            with self.subTest(name):
+                self.assertEqual(self.keep_in(name), [])
+        self.assertEqual([file.name for file in self.keep_in("Documents", "Documents")], ["Documents/a.txt"])
+        real = os.lstat
+
+        def elsewhere(path, *rest, **options):
+            info = real(path, *rest, **options)
+            if str(path).endswith("Documents"):
+                return os.stat_result((info.st_mode, info.st_ino, info.st_dev + 1, *info[3:]))
+            return info
+
+        with mock.patch("downkeep.evidence.os.lstat", elsewhere):
+            self.assertEqual(self.keep_in("Documents"), [])
+        with mock.patch("downkeep.evidence.os.path.realpath", lambda path: path + "x"):
+            self.assertEqual(self.keep_in("Documents"), [])
+
+    def test_a_hard_link_in_a_subfolder_is_not_a_copy(self):
+        (self.folder / "Documents").mkdir()
+        path = self.add("a.txt", b"same", days=9)
+        self.add("b.txt", b"same", days=1)
+        try:
+            os.link(path, self.folder / "Documents" / "a.txt")
+        except OSError:
+            self.skipTest("hard links are not allowed here")
+        self.assertEqual(self.groups("Documents"), [["a.txt", "b.txt"]])
+
+    def test_keepers_of_another_size_are_not_read(self):
+        (self.folder / "Documents").mkdir()
+        self.add("Documents/big.bin", b"x" * 100)
+        self.add("a.txt", b"same")
+        keepers = self.keep_in("Documents")
+        self.assertEqual(len(keepers), 1)
+        with mock.patch("os.open", side_effect=AssertionError("opened")):
+            self.assertEqual(find_duplicates(scan(self.folder).files, keepers), [])
+
+    def test_the_report_names_the_subfolder(self):
+        from downkeep.report import build
+
+        (self.folder / "Documents").mkdir()
+        self.add("Documents/Resume.pdf", b"same")
+        self.add("Resume (1).pdf", b"same")
+        snapshot = scan(self.folder)
+        report = build(snapshot, duplicates=find_duplicates(snapshot.files, self.keep_in("Documents")), extracted=[])
+        self.assertEqual(report["duplicates"][0]["names"], ["Documents/Resume.pdf", "Resume (1).pdf"])
+        self.assertEqual(report["proven"], {"files": 1, "bytes": 4})

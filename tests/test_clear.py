@@ -94,8 +94,8 @@ class ClearTest(FolderTest):
     def find(self, original, identity):
         return None
 
-    def clear(self, *names):
-        result = apply_clear(self.store, str(self.folder), list(names))
+    def clear(self, *names, keep_in=()):
+        result = apply_clear(self.store, str(self.folder), list(names), keep_in)
         self.assertEqual(sorted(result.done + [stay.name for stay in result.skipped]), sorted(set(names)))
         self.why = {stay.name: stay.why for stay in result.skipped}
         return result
@@ -129,7 +129,7 @@ class ClearTest(FolderTest):
             self.add(f"{index}.txt", b"same", days=9 - index)
         self.clear("0.txt", "1.txt", "2.txt", "3.txt")
         self.assertEqual(self.outside(), ["0.txt"])
-        self.assertIn("no proof", self.why["0.txt"])
+        self.assertEqual(self.why["0.txt"], "It is the copy that stays.")
 
     def test_asking_twice_is_asking_once(self):
         self.add("old.txt", b"same", days=9)
@@ -154,8 +154,8 @@ class ClearTest(FolderTest):
         self.add("new.txt", b"same", days=2)
         real = clear._cases
 
-        def edit(snapshot):
-            cases = real(snapshot)
+        def edit(snapshot, keepers):
+            cases = real(snapshot, keepers)
             keeper.write_bytes(b"diff")
             return cases
 
@@ -171,8 +171,8 @@ class ClearTest(FolderTest):
         self.add("2.txt", b"same", days=2)
         real = clear._cases
 
-        def drop(snapshot):
-            cases = real(snapshot)
+        def drop(snapshot, keepers):
+            cases = real(snapshot, keepers)
             os.rename(keeper, self.bin / "gone")
             return cases
 
@@ -331,8 +331,8 @@ class ClearTest(FolderTest):
                 (self.folder / "a" / "2.txt").write_bytes(b"two")
                 real = clear._cases
 
-                def edit(snapshot):
-                    cases = real(snapshot)
+                def edit(snapshot, keepers):
+                    cases = real(snapshot, keepers)
                     if content is None:
                         os.rename(self.folder / "a" / "2.txt", self.bin / "two")
                     else:
@@ -361,7 +361,8 @@ class ClearTest(FolderTest):
         self.extract("a.zip", {"a/1.txt": b"one"}, days=9)
         self.add("b.zip", zipped({"a/1.txt": b"one"}), days=2)
         self.clear("a.zip", "b.zip")
-        self.assertEqual(self.outside(), ["a/1.txt"])
+        self.assertEqual(self.outside(), ["a.zip", "a/1.txt"])
+        self.assertEqual(self.why["a.zip"], "It is the copy that stays.")
 
     def test_two_identical_zips_not_extracted_leave_one(self):
         self.add("a.zip", zipped({"a/1.txt": b"one"}), days=9)
@@ -373,15 +374,15 @@ class ClearTest(FolderTest):
         self.extract("a.zip", {"a/1.txt": b"one"}, days=9)
         self.add("b.bin", zipped({"a/1.txt": b"one"}), days=2)
         self.clear("a.zip", "b.bin")
-        self.assertEqual(self.outside(), ["a/1.txt", "b.bin"])
+        self.assertEqual(self.outside(), ["a.zip", "a/1.txt"])
 
     def test_a_zip_that_lost_its_files_but_has_a_copy(self):
         self.extract("a.zip", {"a/1.txt": b"one"}, days=2)
         self.add("b.zip", zipped({"a/1.txt": b"one"}), days=9)
         real = clear._cases
 
-        def lose(snapshot):
-            cases = real(snapshot)
+        def lose(snapshot, keepers):
+            cases = real(snapshot, keepers)
             os.rename(self.folder / "a" / "1.txt", self.bin / "one")
             return cases
 
@@ -474,6 +475,74 @@ class ClearTest(FolderTest):
     def test_many_random_folders_never_lose_anything(self):
         random_folders(self, 150)
 
+    def test_many_random_folders_with_tidied_keepers(self):
+        random_folders(self, 150, keep_in=True)
+
+    def tidied(self):
+        (self.folder / "Documents").mkdir()
+        self.add("Documents/cv.pdf", b"same", days=1)
+        return self.add("cv.pdf", b"same", days=9)
+
+    def test_a_copy_of_a_tidied_file(self):
+        self.tidied()
+        self.assertIn("no proof", self.why["cv.pdf"]) if not self.clear("cv.pdf").done else self.fail("no keeper")
+        self.assertEqual(self.clear("cv.pdf", keep_in=["Documents"]).done, ["cv.pdf"])
+        self.assertEqual(self.outside(), ["Documents/cv.pdf"])
+
+    def test_the_kept_file_itself_is_never_asked_for(self):
+        self.tidied()
+        self.clear("Documents/cv.pdf", "Documents", keep_in=["Documents"])
+        self.assertEqual(self.sent, [])
+
+    def test_the_subfolder_becomes_a_link(self):
+        self.tidied()
+        real = clear._cases
+
+        def swap(snapshot, keepers):
+            cases = real(snapshot, keepers)
+            os.rename(self.folder / "Documents", self.bin / "Documents")
+            self.symlink("Documents", self.bin / "Documents")
+            return cases
+
+        with mock.patch("downkeep.clear._cases", swap):
+            self.clear("cv.pdf", keep_in=["Documents"])
+        self.assertEqual(self.sent, [])
+        self.assertIn("proof", self.why["cv.pdf"])
+
+    def test_the_kept_file_changes(self):
+        self.tidied()
+        real = clear._cases
+
+        def edit(snapshot, keepers):
+            cases = real(snapshot, keepers)
+            (self.folder / "Documents" / "cv.pdf").write_bytes(b"diff")
+            return cases
+
+        with mock.patch("downkeep.clear._cases", edit):
+            self.clear("cv.pdf", keep_in=["Documents"])
+        self.assertEqual(self.sent, [])
+
+    def test_the_kept_file_goes_but_a_loose_copy_is_still_there(self):
+        self.tidied()
+        self.add("cv (1).pdf", b"same", days=5)
+        real = clear._cases
+
+        def drop(snapshot, keepers):
+            cases = real(snapshot, keepers)
+            os.rename(self.folder / "Documents" / "cv.pdf", self.bin / "cv.pdf")
+            return cases
+
+        with mock.patch("downkeep.clear._cases", drop):
+            self.clear("cv.pdf", "cv (1).pdf", keep_in=["Documents"])
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(len(self.outside()), 1)
+
+    def test_the_plain_name_stays(self):
+        self.add("cv (1).pdf", b"same", days=9)
+        self.add("cv.pdf", b"same", days=1)
+        self.clear("cv.pdf", "cv (1).pdf")
+        self.assertEqual((self.outside(), self.why), (["cv.pdf"], {"cv.pdf": "It is the copy that stays."}))
+
 
 def random_folder(chance, folder):
     contents = [bytes([65 + index]) * chance.randint(1, 40) for index in range(4)]
@@ -510,7 +579,7 @@ def random_folder(chance, folder):
     return made
 
 
-def random_folders(test, count):
+def random_folders(test, count, keep_in=False):
     total = Counter()
     base = test.folder
 
@@ -534,7 +603,8 @@ def random_folders(test, count):
             asked = chance.sample(top, chance.randint(len(top) // 2, len(top))) if top else []
             present = {path for path in before if path.exists()}
             outside_before = {before[path] for path in present}
-            result = test.clear(*asked)
+            subfolders = chance.sample(["s1", "s2", "missing", "s2/deep"], 2) if keep_in else []
+            result = test.clear(*asked, keep_in=subfolders)
             after = {path for path in before if path.exists()}
             gone = present - after
             kept = {before[path] for path in after}
@@ -579,8 +649,8 @@ class LinuxClearTest(FolderTest):
         self.store = Store(self.folder.parent / "records")
         self.addCleanup(self.store.close)
 
-    def clear(self, *names):
-        result = apply_clear(self.store, str(self.folder), list(names))
+    def clear(self, *names, keep_in=()):
+        result = apply_clear(self.store, str(self.folder), list(names), keep_in)
         self.why = {stay.name: stay.why for stay in result.skipped}
         return result
 
@@ -628,7 +698,8 @@ class LinuxClearTest(FolderTest):
             ("downkeep.trash.send", "before"), ("downkeep.trash.send", "after"),
         ]
         for (target, when), again in [(step, False) for step in steps] + [(step, True) for step in steps]:
-            with self.subTest(target, when=when, again=again), tempfile.TemporaryDirectory(dir=self.folder.parent) as home:
+            with self.subTest(target, when=when, again=again), \
+                    tempfile.TemporaryDirectory(dir=self.folder.parent) as home:
                 code = textwrap.dedent("""
                     import os, sys
                     from importlib import import_module

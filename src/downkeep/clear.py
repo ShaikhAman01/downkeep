@@ -3,7 +3,9 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 
 from downkeep import trash
-from downkeep.evidence import Extracted, find_duplicates, find_extracted, verify_copy, verify_extracted
+from downkeep.evidence import (
+    Extracted, find_duplicates, find_extracted, find_keepers, verify_copy, verify_extracted,
+)
 from downkeep.model import ActionError, Identity, Result, Stay
 from downkeep.scan import FileRecord, ScanError, scan
 
@@ -17,7 +19,8 @@ class Case:
     copies: tuple[FileRecord, ...] = ()
 
 
-def apply_clear(store, folder: str, names: Sequence[str]) -> Result:
+def apply_clear(store, folder: str, names: Sequence[str], keep_in: Sequence[str] = ()) -> Result:
+    """Moves proven clutter to the Trash. Copies may also be proven by a file directly inside keep_in subfolders."""
     if not trash.SUPPORTED:
         raise ActionError("Moving to the Trash is not available on this system yet.")
     from downkeep.engine import _recover
@@ -28,15 +31,18 @@ def apply_clear(store, folder: str, names: Sequence[str]) -> Result:
             snapshot = scan(folder)
         except ScanError as error:
             raise ActionError(str(error)) from error
-        cases = _cases(snapshot)
+        cases, keeping = _cases(snapshot, find_keepers(snapshot.folder, keep_in))
         known = {file.name for file in snapshot.files}
+        wanted = dict.fromkeys(name for name in names if isinstance(name, str))
         result = Result()
-        for name in dict.fromkeys(names):
+        for name in wanted:
             if name not in known:
                 result.skipped.append(Stay(name, "It isn't there any more, or it just changed."))
+            elif name in keeping:
+                result.skipped.append(Stay(name, "It is the copy that stays."))
             elif name not in cases:
                 result.skipped.append(Stay(name, "There is no proof for it now, so it stays."))
-        todo = [case for name, case in cases.items() if name in names]
+        todo = [case for name, case in cases.items() if name in wanted]
         if todo:
             result.batch = store.begin("trash", snapshot.folder)
             try:
@@ -46,14 +52,15 @@ def apply_clear(store, folder: str, names: Sequence[str]) -> Result:
         return result
 
 
-def _cases(snapshot):
-    """Everything proven, in the order it is shown: zips first. The first of a group of copies stays."""
+def _cases(snapshot, keepers):
+    """Everything proven, in the order it is shown: zips first. The first of a group of copies always stays."""
     cases = {item.archive.name: Case(item.archive, item) for item in find_extracted(snapshot.files, snapshot.folder)}
-    for group in find_duplicates(snapshot.files):
-        for file in group.files:
-            if file.name in cases or file is not group.files[0]:
-                cases.setdefault(file.name, Case(file)).copies = group.files
-    return cases
+    groups = find_duplicates(snapshot.files, keepers)
+    keeping = {group.files[0].name for group in groups}
+    for group in groups:
+        for file in group.files[1:]:
+            cases.setdefault(file.name, Case(file)).copies = group.files
+    return {name: case for name, case in cases.items() if name not in keeping}, keeping
 
 
 def _clear(store, folder, todo, result):
@@ -98,7 +105,9 @@ def _proofs(case: Case, waiting: set[str]) -> Iterator[tuple[str, ...]]:
 
 
 def _outside(paths, file):
-    """The files behind a proof, or nothing if one is in the Trash, on another disk or the file itself."""
+    """The files behind a proof, or nothing if one is in a Trash, behind a link, on another disk or is the file."""
+    if any(os.path.realpath(path) != path for path in paths):
+        return set()
     found = [os.lstat(path) for path in paths]
     keys = {(info.st_dev, info.st_ino) for info in found}
     if (file.device, file.inode) in keys or any(device != file.device for device, _ in keys):

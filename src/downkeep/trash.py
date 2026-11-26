@@ -47,8 +47,24 @@ def restore(original: str, place: str, identity: Identity) -> None:
         raise ActionError("Another file has that name now.") from error
     _flush(folder)
     _flush(files)
-    note = os.path.join(os.path.dirname(files), "info", name + NOTE)
-    if _noted(note) == original:
+    _drop_note(os.path.dirname(files), name, original)
+
+
+def drop_notes(original: str) -> None:
+    """After a crash between writing a note and the move: removes notes for this file that has no file in the Trash."""
+    for trash in _trashes(original) if LINUX else ():
+        try:
+            names = sorted(os.listdir(os.path.join(trash, "info")))
+        except OSError:
+            continue
+        for name in names:
+            if name.endswith(NOTE):
+                _drop_note(trash, name.removesuffix(NOTE), original)
+
+
+def _drop_note(trash, name, original):
+    note = os.path.join(trash, "info", name + NOTE)
+    if not os.path.lexists(os.path.join(trash, "files", name)) and _noted(note) == original:
         os.unlink(note)
 
 
