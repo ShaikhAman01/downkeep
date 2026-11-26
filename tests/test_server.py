@@ -14,6 +14,10 @@ from unittest import mock
 from downkeep import server, window
 from downkeep.server import App, make_server
 from tests.helpers import FolderTest
+from tests.test_actions import FakeActions
+
+
+SCRIPTS = ["app.js", "ask.js", "auto.js", "clutter.js", "core.js", "rules.js", "runs.js", "tidy.js"]
 
 
 class Clock:
@@ -65,7 +69,8 @@ class ServerTest(FolderTest):
         self.assertEqual(self.server.server_address[0], "127.0.0.1")
 
     def test_pages(self):
-        for path, kind in {"/": "text/html", "/style.css": "text/css", "/app.js": "text/javascript", "/icon.svg": "image/svg+xml"}.items():
+        scripts = {f"/{name}": "text/javascript" for name in SCRIPTS}
+        for path, kind in {"/": "text/html", "/style.css": "text/css", **scripts, "/icon.svg": "image/svg+xml"}.items():
             with self.subTest(path=path):
                 status, content, headers = self.ask("GET", path)
                 self.assertEqual((status, headers.get_content_type()), (200, kind))
@@ -373,14 +378,40 @@ class ServerTest(FolderTest):
             self.assertEqual(self.ask("GET", "/")[0], 200)
 
     def test_page_loads_nothing_from_elsewhere(self):
-        for name in ["index.html", "style.css", "app.js", "icon.svg"]:
+        for name in ["index.html", "style.css", *SCRIPTS, "icon.svg"]:
             text = files("downkeep").joinpath("page", name).read_text(encoding="utf-8")
             text = text.replace("http://www.w3.org/2000/svg", "")
             with self.subTest(name=name):
                 self.assertNotRegex(text, r"https?://|//cdn|@import|url\(")
-                self.assertNotRegex(text, r"innerHTML|outerHTML|insertAdjacentHTML|document\.write|eval\(|localStorage")
+                self.assertNotRegex(text, r"innerHTML|outerHTML|insertAdjacentHTML|document\.write|eval\(|localStorage|new Function|cssText")
+                self.assertNotRegex(text, r"\b(alert|confirm|prompt)\(|\u2014|\u2013")
         page = files("downkeep").joinpath("page", "index.html").read_text(encoding="utf-8")
         self.assertIsNone(re.search(r"<script(?![^>]*\bsrc=)|\sstyle=|\son\w+=", page))
+
+    def test_every_script_of_the_page_is_served_and_nothing_else(self):
+        folder = files("downkeep").joinpath("page")
+        found = {item.name for item in folder.iterdir() if item.name.endswith(".js")}
+        self.assertEqual(found, set(SCRIPTS))
+        for name in SCRIPTS:
+            for wanted in re.findall(r'from "\./([^"]+)"', folder.joinpath(name).read_text(encoding="utf-8")):
+                self.assertIn(f"/{wanted}", server.PAGES)
+
+    def test_every_question_goes_through_one_place(self):
+        for name in SCRIPTS:
+            text = files("downkeep").joinpath("page", name).read_text(encoding="utf-8")
+            with self.subTest(name=name):
+                self.assertEqual(bool(re.search(r"\bfetch\(|XMLHttpRequest|WebSocket|EventSource|sendBeacon|import\(", text)), name == "ask.js")
+
+    def test_the_page_asks_only_for_routes_that_exist(self):
+        key = self.key()
+        self.app.actions = FakeActions()
+        asked = set()
+        for name in SCRIPTS:
+            asked |= set(re.findall(r'"(/api/[a-z/]+)"', files("downkeep").joinpath("page", name).read_text(encoding="utf-8")))
+        self.assertGreaterEqual(len(asked), 14)
+        for path in asked - {"/api/stay", "/api/session"}:
+            with self.subTest(path=path):
+                self.assertNotEqual((self.call(path, key)[0], self.call(path, key)[1]), (404, b'{"error": "not found"}'))
 
 
 class WindowTest(unittest.TestCase):

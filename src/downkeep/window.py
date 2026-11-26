@@ -41,17 +41,28 @@ def show_in_folder(path: str) -> None:
         _start(["xdg-open", os.path.dirname(path)])
 
 
+def write_link(place: str, url: str) -> None:
+    """For testing the packaged app: the link goes to a new private file instead of a browser."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    with open(os.open(place, flags, 0o600), "w", encoding="utf-8") as file:
+        file.write(url)
+
+
 def tell(text: str) -> None:
     """Shows a message without a terminal, and always keeps a copy in the log."""
+    log(text)
+    try:
+        _message(text)
+    except OSError:
+        pass
+
+
+def log(text: str) -> None:
     try:
         place = _log_file()
         place.parent.mkdir(parents=True, exist_ok=True)
-        with open(place, "a", encoding="utf-8") as log:
-            log.write(f"{datetime.now():%Y-%m-%d %H:%M} {text}\n")
-    except OSError:
-        pass
-    try:
-        _message(text)
+        with open(place, "a", encoding="utf-8") as file:
+            file.write(f"{datetime.now():%Y-%m-%d %H:%M} {text}\n")
     except OSError:
         pass
 

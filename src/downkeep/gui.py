@@ -1,11 +1,13 @@
 import sys
 
-from downkeep.cli import open_app
+from downkeep.cli import auto_run, open_app
 from downkeep.window import tell
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     """Started by double-click: there is no terminal, so problems are shown as a message."""
+    if "--auto-run" in (sys.argv[1:] if argv is None else argv):
+        return auto_run()
     try:
         return open_app(None, tell=tell)
     except Exception as error:

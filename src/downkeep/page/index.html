@@ -11,16 +11,23 @@
 </head>
 <body>
   <div id="app" class="app plain">
-    <header class="side">
+    <header id="side" class="side">
       <div class="top">
         <p class="name">Downkeep</p>
         <button id="again" class="link" type="button" hidden>Check again</button>
       </div>
       <div id="sum"></div>
+      <div id="tabs" class="tabs" role="tablist" aria-label="What to do" hidden>
+        <button id="tab-clutter" type="button" role="tab" aria-controls="stage" aria-selected="true">Clutter</button>
+        <button id="tab-tidy" type="button" role="tab" aria-controls="stage" aria-selected="false" tabindex="-1">Tidy</button>
+        <button id="tab-auto" type="button" role="tab" aria-controls="stage" aria-selected="false" tabindex="-1">Automatic</button>
+      </div>
     </header>
     <nav id="list" aria-label="Files"></nav>
-    <main id="main" class="stage">
-      <noscript><p class="say">Downkeep needs JavaScript. It runs only on your computer.</p></noscript>
+    <main id="main">
+      <div id="stage" class="stage">
+        <noscript><p class="say">Downkeep needs JavaScript. It runs only on your computer.</p></noscript>
+      </div>
     </main>
   </div>
   <p id="status" class="toast" role="status"></p>

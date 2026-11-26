@@ -5,11 +5,70 @@ from pathlib import Path
 from unittest import mock
 
 from downkeep import gui, window
+from downkeep.model import ActionError, Busy, Result
+from tests.test_actions import FakeActions
 
 PACKAGING = Path(__file__).parent.parent / "packaging"
 
 
 class GuiTest(unittest.TestCase):
+    def setUp(self):
+        self.actions = FakeActions()
+        for name in ["downkeep.server.Actions", "downkeep.cli.Actions"]:
+            patch = mock.patch(name, return_value=self.actions)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def auto_run(self, *args):
+        with (
+            mock.patch("sys.stdout", None),
+            mock.patch("sys.stderr", None),
+            mock.patch("downkeep.window._message", side_effect=AssertionError("showed a message")),
+            mock.patch("downkeep.cli.open_window", side_effect=AssertionError("opened a window")),
+            mock.patch("downkeep.cli.make_server", side_effect=AssertionError("started a server")),
+            mock.patch("downkeep.cli.log") as log,
+        ):
+            return gui.main(*args), [call.args[0] for call in log.call_args_list]
+
+    def test_auto_run_is_silent(self):
+        self.assertEqual(self.auto_run(["--auto-run"]), (0, []))
+        self.assertEqual(self.actions.calls, [("auto_run",)])
+
+    def test_auto_run_from_the_command_line_of_the_app(self):
+        with mock.patch("sys.argv", ["Downkeep", "--auto-run"]):
+            self.assertEqual(self.auto_run(), (0, []))
+        self.assertEqual(self.actions.calls, [("auto_run",)])
+
+    def test_auto_run_problems_go_to_the_log(self):
+        for error, code, said in [
+            (Busy("x"), 0, []),
+            (ActionError("It is full\n"), 1, ["Automatic tidying: It is full\N{REPLACEMENT CHARACTER}"]),
+            (OSError("/private"), 1, ["Automatic tidying failed (OSError)."]),
+        ]:
+            with self.subTest(error=error):
+                self.actions.error = error
+                self.assertEqual(self.auto_run(["--auto-run"]), (code, said))
+
+    def test_auto_run_where_nothing_can_move(self):
+        self.actions.features["tidy"] = False
+        self.assertEqual(self.auto_run(["--auto-run"]), (0, []))
+        self.assertEqual(self.actions.calls, [])
+
+    def test_other_arguments_open_the_window(self):
+        with mock.patch("downkeep.gui.open_app", return_value=0) as app, mock.patch("sys.argv", ["x", "--auto-run"]):
+            gui.main([])
+        app.assert_called_once()
+
+    def test_opening_recovers_first(self):
+        self.actions.left = Result(None, ["a"])
+        with (
+            mock.patch("downkeep.cli.open_window", side_effect=lambda url: self.actions.calls.append("window") or True),
+            mock.patch("downkeep.cli.App.finished", return_value=True),
+            mock.patch("builtins.print"),
+        ):
+            self.assertEqual(gui.main([]), 0)
+        self.assertEqual([call if call == "window" else call[0] for call in self.actions.calls], ["recover", "refresh", "window"])
+
     def test_opens_the_usual_folder(self):
         with mock.patch("downkeep.gui.open_app", return_value=0) as app:
             self.assertEqual(gui.main(), 0)
