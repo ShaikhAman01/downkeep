@@ -76,8 +76,13 @@ class CommandTest(Case):
         expected = ["/home/x/Downkeep.AppImage", "--auto-run"]
         inside = {"APPIMAGE": expected[0], "APPDIR": "/tmp/.mount_x"}
         self.assertEqual(self.command("/tmp/.mount_x/usr/bin/downkeep", frozen=True, **inside), expected)
-        self.assertEqual(self.command("/tmp/.mount_x/usr/bin/python3", **inside), expected)
-        self.assertEqual(self.command("/tmp/x/downkeep", frozen=True, APPIMAGE=expected[0]), expected)
+
+    def test_appimage_values_are_used_only_inside_the_frozen_app(self):
+        image = {"APPIMAGE": "/home/x/Downkeep.AppImage"}
+        mounted = image | {"APPDIR": "/tmp/.mount_x"}
+        self.assertEqual(self.command("/tmp/.mount_x/usr/bin/python3", **mounted)[1:], ["-m", "downkeep", "auto-run"])
+        self.assertEqual(self.command("/opt/downkeep", frozen=True, **image), ["/opt/downkeep", "--auto-run"])
+        self.assertEqual(self.command("/usr/bin/python3", **image)[0], "/usr/bin/python3")
 
     def test_values_inherited_from_another_appimage(self):
         inside = {"APPIMAGE": "/home/x/Terminal.AppImage", "APPDIR": "/tmp/.mount_t"}
@@ -224,6 +229,25 @@ class LinuxTest(Case):
                 schedule.install([path, "--auto-run"], run=fake)
             self.assertFalse(self.service.exists())
 
+    def test_a_copy_run_from_source_finds_its_package(self):
+        command = ["/usr/bin/python3", "-m", "downkeep", "auto-run"]
+        with mock.patch("downkeep.schedule.source_folder", return_value="/home/x/code/down keep/src"):
+            schedule.install(command, run=Fake())
+            self.assertIn('Environment="PYTHONPATH=/home/x/code/down keep/src"\n', self.service.read_text(encoding="utf-8"))
+            schedule.install(COMMAND, run=Fake())
+            self.assertNotIn("PYTHONPATH", self.service.read_text(encoding="utf-8"))
+        with mock.patch("downkeep.schedule.source_folder", return_value=None):
+            schedule.install(command, run=Fake())
+            self.assertNotIn("PYTHONPATH", self.service.read_text(encoding="utf-8"))
+
+    def test_source_folder(self):
+        here = str(Path(schedule.__file__).resolve().parent.parent)
+        with mock.patch("site.getsitepackages", return_value=[here]):
+            self.assertIsNone(schedule.source_folder())
+        with mock.patch("site.getsitepackages", return_value=["/nowhere"]), \
+                mock.patch("site.getusersitepackages", return_value="/nowhere/either"):
+            self.assertEqual(schedule.source_folder(), here)
+
     def test_records_folder_is_passed_on(self):
         with mock.patch.dict(os.environ, {"XDG_STATE_HOME": '/x/100% "a"', "DOWNKEEP_DATA": "bad\nExecStart=/evil"}):
             schedule.install(COMMAND, run=Fake())
@@ -363,8 +387,23 @@ class WindowsTest(Case):
             self.install(COMMAND, code=1)
         self.assertFalse(os.path.exists(self.path))
 
+    def test_percent_is_refused_because_windows_would_expand_it(self):
+        for command in ([r"C:\a%PATH%b\Downkeep.exe", "--auto-run"], [r"C:\D\Downkeep.exe", "%TEMP%"]):
+            with self.assertRaises(ActionError) as caught:
+                schedule.install(command, run=Fake())
+            self.assertIn("%", str(caught.exception))
+
+    def test_a_copy_run_from_source_is_refused_plainly(self):
+        with mock.patch("downkeep.schedule.source_folder", return_value=r"C:\code\downkeep\src"):
+            with self.assertRaises(ActionError) as caught:
+                schedule.install([r"C:\Py\pythonw.exe", "-m", "downkeep", "auto-run"], run=Fake())
+            self.assertIn("installed copy", str(caught.exception))
+            self.install([r"C:\D\Downkeep.exe", "--auto-run"])
+        with mock.patch("downkeep.schedule.source_folder", return_value=None):
+            self.install([r"C:\Py\pythonw.exe", "-m", "downkeep", "auto-run"])
+
     def test_odd_paths_survive(self):
-        for name in ODD:
+        for name in (name for name in ODD if "%" not in name):
             command = [ntpath.join("C:\\", name, "a.exe"), name, "", "a b", 'x"y', "\\"]
             with self.subTest(name=name):
                 self.install(command)
@@ -381,8 +420,21 @@ class WindowsTest(Case):
     def test_installed_command_in_any_encoding(self):
         command = [r"C:\Décor\a.exe", "--auto-run"]
         text = schedule.make_task(command)
-        for raw in (text.encode("utf-16"), text.encode("utf-16-le"), text.encode("utf-8"), text.encode("latin-1")):
+        for raw in (text.encode("utf-16"), text.encode("utf-16-le"), text.encode("utf-8")):
             self.assertEqual(schedule.installed_command(run=Fake(output=raw)), command)
+        for page in ("cp850", "cp437", "cp1252"):
+            with mock.patch("downkeep.schedule._oem", return_value=page):
+                self.assertEqual(schedule.installed_command(run=Fake(output=text.encode(page))), command)
+
+    def test_characters_the_code_page_lacks_never_match(self):
+        command = [r"C:\発\a.exe", "--auto-run"]
+        raw = schedule.make_task(command).encode("cp850", "replace")
+        with mock.patch("downkeep.schedule._oem", return_value="cp850"):
+            self.assertEqual(schedule.installed_command(run=Fake(output=raw)), [r"C:\?\a.exe", "--auto-run"])
+
+    @unittest.skipIf(sys.platform == "win32", "the real code page is used there")
+    def test_code_page_outside_windows(self):
+        self.assertEqual(schedule._oem(), "cp437")
 
     def test_nothing_installed_or_not_ours(self):
         self.assertIsNone(schedule.installed_command(run=Fake(code=1)))

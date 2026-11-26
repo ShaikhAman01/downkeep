@@ -374,15 +374,23 @@ class SavedRulesTest(FolderTest):
 class SuggestNameTest(unittest.TestCase):
     def test_names(self):
         for given, expected in [
-            ({"sites": ["college.example.edu"]}, "College"), ({"sites": ["github.com"]}, "Github"),
-            ({"sites": ["www.bbc.co.uk"]}, "Bbc"), ({"sites": ["mail.ox.ac.uk"]}, "Ox"), ({"sites": ["bbc.co.uk"]}, "Bbc"), ({"sites": ["dl.example.com"]}, "Example"),
-            ({"sites": ["xn--bcher-kva.example"]}, "Bücher"), ({"sites": ["10.0.0.1"]}, "New folder"),
+            ({"sites": ["college.example.edu"]}, "College"), ({"sites": ["github.com"]}, "GitHub"), ({"sites": ["notgithub.com"]}, "Notgithub"), ({"sites": ["gist.githubusercontent.com"]}, "GitHub"),
+            ({"sites": ["drive.google.com"]}, "Google Drive"), ({"sites": ["docs.google.com"]}, "Google"),
+            ({"sites": ["web.whatsapp.com"]}, "WhatsApp"), ({"sites": ["lms.college.example.edu"]}, "College"),
+            ({"sites": ["moodle.uni.ac.in"]}, "Uni"), ({"sites": ["my.portal.bank.com"]}, "Bank"),
+            ({"sites": ["example.com"]}, "New folder"), ({"sites": ["www.example.org"]}, "New folder"),
+            ({"sites": ["files.site.test"]}, "New folder"), ({"sites": ["a.localhost"]}, "New folder"),
+            ({"sites": ["www.bbc.co.uk"]}, "Bbc"), ({"sites": ["mail.ox.ac.uk"]}, "Ox"), ({"sites": ["bbc.co.uk"]}, "Bbc"), ({"sites": ["dl.shop.com"]}, "Shop"),
+            ({"sites": ["xn--bcher-kva.de"]}, "Bücher"), ({"sites": ["10.0.0.1"]}, "New folder"),
             ({"sites": ["10.0.0.1"], "words": ["invoice"]}, "Invoices"), ({"words": ["receipt"]}, "Receipts"),
             ({"words": ["lecture"]}, "Lectures"), ({"words": ["lecture notes"]}, "Lectures"), ({"words": ["tax"]}, "Tax"),
-            ({"words": ["physics"]}, "Physics"), ({"words": ["Invoice"]}, "Invoice"), ({"words": ["cs101"]}, "Cs101"),
+            ({"words": ["physics"]}, "Physics"), ({"words": ["Invoice"]}, "Invoices"), ({"words": ["screenshot"]}, "Screenshots"),
+            ({"words": ["data"]}, "Data"), ({"words": ["news"]}, "News"), ({"words": ["homework"]}, "Homework"),
+            ({"words": ["media"]}, "Media"), ({"words": ["structures"]}, "Structures"), ({"words": ["drawing"]}, "Drawing"),
+            ({"words": ["lemon"]}, "Lemon"), ({"words": ["cs101"]}, "Cs101"),
             ({"words": ["café"]}, "Café"), ({"words": ["发票"]}, "发票"), ({"words": ["wash"]}, "Wash"),
             ({"kinds": ["images"]}, "Pictures"), ({"extensions": ["pdf"]}, "PDF files"),
-            ({"extensions": ["tar.gz"]}, "TAR.GZ files"), ({"words": ["con"]}, "Cons"), ({"words": ["CON"]}, "New folder"),
+            ({"extensions": ["tar.gz"]}, "TAR.GZ files"), ({"words": ["con"]}, "New folder"), ({"words": ["CON"]}, "New folder"),
             ({"words": ["a/b"]}, "New folder"), ({"words": ["x" * 70]}, "New folder"), ({}, "New folder"),
             ({"sites": [None], "words": [5]}, "New folder"),
         ]:
@@ -411,7 +419,7 @@ class SuggestTest(unittest.TestCase):
             ("College", "3 files came from college.example.edu", 3)])
         for item in found:
             self.assertEqual(check_rules([item["rule"]])[0], item["rule"])
-            self.assertEqual((item["rule"]["on"], item["rule"]["auto"], item["rule"]["days"]), (True, False, 7))
+            self.assertEqual((item["rule"]["on"], item["rule"]["auto"], item["rule"]["days"]), (True, True, 1))
             self.assertNotIn(item["rule"]["id"], [default["id"] for default in DEFAULT_RULES])
         self.assertEqual(found[0]["rule"]["words"], ["invoice"])
         self.assertEqual(found[1]["rule"]["sites"], ["college.example.edu"])
@@ -457,7 +465,7 @@ class SuggestTest(unittest.TestCase):
     def test_at_most_three_and_best_first(self):
         names = [f"{word} {n}.zzz" for word, count in (("lemon", 6), ("mango", 5), ("olive", 4), ("peach", 3))
                  for n in range(count)]
-        self.assertEqual([item["folder"] for item in self.suggested(names)], ["Lemons", "Mangos", "Olives"])
+        self.assertEqual([item["folder"] for item in self.suggested(names)], ["Lemon", "Mango", "Olive"])
 
     def test_names_already_in_use_are_skipped(self):
         names = [f"invoice {n}.pdf" for n in range(3)]

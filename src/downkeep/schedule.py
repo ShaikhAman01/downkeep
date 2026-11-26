@@ -2,6 +2,7 @@ import ntpath
 import os
 import re
 import shutil
+import site
 import subprocess
 import sys
 import tempfile
@@ -114,16 +115,23 @@ def command() -> list[str]:
     program = sys.executable
     if not program:
         raise ActionError("Downkeep couldn't find its own program, so it can't be scheduled")
-    image, mounted = os.environ.get("APPIMAGE"), os.environ.get("APPDIR")
+    image, mounted, frozen = os.environ.get("APPIMAGE"), os.environ.get("APPDIR"), getattr(sys, "frozen", False)
     # Inside an AppImage the program runs from a mount that is gone later. Another AppImage's values can be inherited.
-    if image and (not mounted or Path(program).is_relative_to(mounted)):
+    if frozen and image and mounted and Path(program).is_relative_to(mounted):
         return [image, "--auto-run"]
-    if getattr(sys, "frozen", False):
+    if frozen:
         return [program, "--auto-run"]
     if PLATFORM == "win32":
         windowless = ntpath.join(ntpath.dirname(program), "pythonw.exe")
         program = windowless if os.path.isfile(windowless) else program
     return [program, "-m", "downkeep", "auto-run"]
+
+
+def source_folder() -> str | None:
+    """The folder holding the downkeep package when Python wouldn't find it by itself, as in a source checkout."""
+    here = Path(__file__).resolve().parent.parent
+    installed = {Path(place).resolve() for place in (*site.getsitepackages(), site.getusersitepackages())}
+    return None if here in installed else str(here)
 
 
 def available(run: Runner = run_command) -> tuple[bool, str]:
@@ -148,6 +156,10 @@ def install(command: list[str], name: str = NAME, run: Runner = run_command) -> 
         raise ActionError("Downkeep is in a folder whose name has characters that can't be scheduled. Move it first.")
     _check_name(name)
     if PLATFORM == "win32":
+        if any("%" in part for part in command):
+            raise ActionError("Windows can't schedule a program in a folder with % in its name. Move Downkeep first.")
+        if command[1:3] == ["-m", "downkeep"] and source_folder():
+            raise ActionError("Automatic tidying needs an installed copy of Downkeep, not one run from its source.")
         _install_task(command, name, run)
     else:
         _install_units(command, name, run)
@@ -218,6 +230,8 @@ def _install_units(command, name, run):
     service, timer, _ = _units(name)
     # The service doesn't get the person's shell settings, so a moved records folder is passed on
     kept = {key: os.environ[key] for key in ("DOWNKEEP_DATA", "XDG_STATE_HOME") if os.environ.get(key)}
+    if command[1:3] == ["-m", "downkeep"] and source_folder():
+        kept["PYTHONPATH"] = source_folder()
     kept = {key: value for key, value in kept.items() if value.isprintable()}
     try:
         service.parent.mkdir(parents=True, exist_ok=True)
@@ -328,13 +342,22 @@ def _query(name, run):
 
 
 def _decode(raw):
+    """schtasks prints the XML in the console's OEM code page when its output goes to a pipe, whatever the XML says.
+    A character that page lacks comes out as "?", so such a path never matches and the schedule is simply rewritten."""
     if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
         return raw.decode("utf-16", "replace")
     if raw[1:2] == b"\0":
         return raw.decode("utf-16-le", "replace")
-    for encoding in ("utf-8", "oem"):
-        try:
-            return raw.decode(encoding)
-        except (LookupError, UnicodeDecodeError):
-            pass
-    return raw.decode("latin-1")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode(_oem(), "replace")
+
+
+def _oem():
+    try:
+        import ctypes
+
+        return f"cp{ctypes.windll.kernel32.GetOEMCP()}"
+    except (AttributeError, OSError):
+        return "cp437"

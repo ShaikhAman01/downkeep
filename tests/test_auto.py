@@ -115,7 +115,7 @@ class Case(FolderTest):
         os.utime(path, ns=(self.now - age, self.now - age))
         return path
 
-    def on(self, *own, days=7, **defaults):
+    def on(self, *own, days=1, **defaults):
         rules = [item | {"days": days} | defaults for item in DEFAULT_RULES]
         self.store.set(RULES_KEY, check_rules([*own, *rules]))
         auto.turn_on(self.store, self.folder)
@@ -129,6 +129,9 @@ class Case(FolderTest):
             self.batch = result.batch or self.batch
             done += result.done
         return sorted(done)
+
+    def hours(self, count):
+        return self.run_at(*[HOUR] * count)
 
     def moved(self):
         return sorted(str(path.relative_to(self.folder).as_posix()) for path in self.folder.glob("*/*"))
@@ -154,25 +157,25 @@ class Behaviour:
         self.put("old.png", age=90 * DAY)
         self.on()
         self.put("new.png")
-        self.assertEqual(self.run_at(HOUR, 6 * DAY), [])
-        self.assertEqual(self.run_at(DAY), ["new.png"])
+        self.assertEqual(self.hours(24), [])
+        self.assertEqual(self.hours(1), ["new.png"])
         self.assertEqual(self.moved(), ["Images/new.png"])
-        self.assertEqual(self.run_at(*[100 * DAY] * 3), [])
+        self.assertEqual(self.hours(72), [])
         self.assertTrue((self.folder / "old.png").exists())
 
     def test_wait_counts_from_first_seen_even_for_an_old_date(self):
         self.on()
         self.put("new.png", age=300 * DAY)
-        self.assertEqual(self.run_at(HOUR, 7 * DAY - 1), [])
-        self.assertEqual(self.run_at(1), ["new.png"])
+        self.assertEqual(self.hours(24), [])
+        self.assertEqual(self.hours(1), ["new.png"])
 
     def test_wait_counts_from_the_last_change_too(self):
         self.on()
         path = self.put("new.png")
-        self.run_at(HOUR, 5 * DAY)
+        self.hours(20)
         os.utime(path, ns=(self.now - 120 * 10**9, self.now - 120 * 10**9))
-        self.assertEqual(self.run_at(HOUR, 6 * DAY), [])
-        self.assertEqual(self.run_at(DAY), ["new.png"])
+        self.assertEqual(self.hours(23), [])
+        self.assertEqual(self.hours(1), ["new.png"])
 
     def test_everything_there_at_the_start_counts_even_what_a_scan_leaves_out(self):
         self.put("growing.mkv.part")
@@ -183,7 +186,7 @@ class Behaviour:
         (self.folder / "growing.mkv.part").rename(self.folder / "growing.mkv")
         (self.folder / ".hidden.png").rename(self.folder / "shown.png")
         self.put("empty.png", b"now full")
-        self.assertEqual(self.run_at(HOUR, *[10 * DAY] * 5), [])
+        self.assertEqual(self.hours(72), [])
         self.assertEqual(self.moved(), [])
 
     def test_old_files_stay_old_when_renamed_edited_or_replaced(self):
@@ -199,7 +202,7 @@ class Behaviour:
         self.put("new.tmp", b"atomic", age=DAY).replace(self.folder / "chain.png")
         self.run_at(HOUR)
         (self.folder / "chain.png").rename(self.folder / "chain2.png")
-        self.assertEqual(self.run_at(HOUR, *[10 * DAY] * 5), [])
+        self.assertEqual(self.hours(72), [])
         self.assertEqual(self.moved(), [])
 
     def test_old_file_changed_in_the_last_minute_is_not_forgotten(self):
@@ -209,7 +212,7 @@ class Behaviour:
         os.utime(path, ns=(self.now, self.now))
         path.rename(self.folder / "older.png")
         auto.run(self.store, self.now)
-        self.assertEqual(self.run_at(HOUR, *[10 * DAY] * 3), [])
+        self.assertEqual(self.hours(72), [])
 
     def test_a_new_file_with_the_name_of_a_deleted_old_one(self):
         self.put("a.png", age=90 * DAY)
@@ -218,7 +221,7 @@ class Behaviour:
         (self.folder / "a.png").rename(self.folder.parent / "elsewhere.png")
         self.run_at(HOUR)
         self.put("a.png")
-        self.assertEqual(self.run_at(HOUR, 8 * DAY), ["a.png"])
+        self.assertEqual(self.hours(25), ["a.png"])
         self.assertTrue(keep.exists())
 
     def test_must_be_the_same_in_two_runs_a_minute_apart(self):
@@ -257,10 +260,10 @@ class Behaviour:
     def test_replaced_by_another_file_starts_again(self):
         self.on()
         self.put("a.png")
-        self.run_at(HOUR, 6 * DAY)
+        self.hours(20)
         self.put("b", age=300 * DAY).replace(self.folder / "a.png")
-        self.assertEqual(self.run_at(HOUR, 6 * DAY), [])
-        self.assertEqual(self.run_at(DAY), ["a.png"])
+        self.assertEqual(self.hours(24), [])
+        self.assertEqual(self.hours(1), ["a.png"])
 
     def test_only_rules_that_are_automatic(self):
         own = {"folder": "Cats", "words": ["cat"], "auto": False, "days": 0}
@@ -272,11 +275,12 @@ class Behaviour:
         self.assertEqual(self.moved(), ["Images/dog.png"])
 
     def test_each_rule_has_its_own_wait(self):
-        self.on({"folder": "Cats", "words": ["cat"], "auto": True, "days": 1}, days=10)
+        self.on({"folder": "Cats", "words": ["cat"], "auto": True, "days": 1}, days=2)
         self.put("cat.png")
         self.put("dog.png")
-        self.assertEqual(self.run_at(HOUR, DAY), ["cat.png"])
-        self.assertEqual(self.run_at(9 * DAY), ["dog.png"])
+        self.assertEqual(self.hours(25), ["cat.png"])
+        self.assertEqual(self.hours(23), [])
+        self.assertEqual(self.hours(1), ["dog.png"])
 
     def test_sites(self):
         self.on({"folder": "College", "sites": ["example.edu"], "auto": True, "days": 0}, days=0)
@@ -324,27 +328,27 @@ class Behaviour:
         self.on()
         for name in ("a.png", "b.png", "c.png"):
             self.put(name)
-        self.run_at(HOUR, 8 * DAY)
+        self.assertEqual(len(self.hours(25)), 3)
         self.undo()
         self.put("b.png", b"edited", age=DAY)
         self.put("x", b"atomic save", age=DAY).replace(self.folder / "c.png")
         (self.folder / "a.png").rename(self.folder / "renamed.png")
-        self.assertEqual(self.run_at(HOUR, *[10 * DAY] * 4), [])
+        self.assertEqual(self.hours(72), [])
         (self.folder / "b.png").rename(self.folder.parent / "away.png")
         self.run_at(HOUR)
         (self.folder.parent / "away.png").rename(self.folder / "b.png")
-        self.assertEqual(self.run_at(HOUR, *[10 * DAY] * 4), [])
+        self.assertEqual(self.hours(72), [])
 
     def test_undone_file_stays_after_off_and_on(self):
         self.on()
         self.put("a.png")
-        self.run_at(HOUR, 8 * DAY)
+        self.assertEqual(self.hours(25), ["a.png"])
         auto.turn_off(self.store)
         self.undo()
         (self.folder / "a.png").rename(self.folder.parent / "away")
         self.on()
         (self.folder.parent / "away").rename(self.folder / "a.png")
-        self.assertEqual(self.run_at(HOUR, *[10 * DAY] * 4), [])
+        self.assertEqual(self.hours(72), [])
 
     def test_two_undone_passes_stop_a_rule_and_say_so(self):
         self.on(days=0)
@@ -393,38 +397,68 @@ class Behaviour:
         self.assertIn("clock", self.status()["note"])
         self.assertEqual(self.store.get(auto.LEDGER), ledger)
         self.now += 2000 * DAY
-        self.assertEqual(self.run_at(HOUR, HOUR, 6 * DAY), [])
-        self.assertEqual(self.run_at(DAY), ["a.png"])
+        self.assertEqual(self.hours(24), [])
+        self.assertEqual(self.hours(1), ["a.png"])
 
     def test_file_first_seen_while_the_clock_was_behind(self):
         self.on()
-        self.run_at(HOUR, 30 * DAY)
-        self.now -= 20 * DAY
+        self.hours(30)
+        self.now -= 20 * HOUR
         self.put("a.png", age=DAY)
-        self.assertEqual(self.run_at(HOUR, HOUR), [])
-        self.now += 20 * DAY
-        self.assertEqual(self.run_at(HOUR, HOUR, 6 * DAY), [])
-        self.assertEqual(self.run_at(DAY), ["a.png"])
+        self.assertEqual(self.hours(2), [])
+        self.now += 20 * HOUR
+        self.assertEqual(self.hours(20), [])
+        self.assertEqual(self.store.get(auto.LEDGER)["files"]["a.png"]["waited"], 20 * HOUR)
+        self.assertEqual(self.hours(3), [])
+        self.assertEqual(self.hours(1), ["a.png"])
 
     def test_clock_set_back_after_first_seen(self):
         self.on()
         self.put("a.png", age=DAY)
-        self.run_at(HOUR, 6 * DAY)
-        self.now -= 3 * DAY
-        self.assertEqual(self.run_at(HOUR, DAY), [])
-        self.now -= 4 * DAY
-        os.utime(self.folder / "a.png", ns=(self.now - DAY, self.now - DAY))
-        self.assertEqual(self.run_at(HOUR, 6 * DAY - HOUR), [])
+        self.hours(20)
+        self.now -= 10 * HOUR
+        self.assertEqual(self.hours(3), [])
+        self.assertEqual(self.store.get(auto.LEDGER)["files"]["a.png"]["waited"], 21 * HOUR)
+        self.assertEqual(self.hours(2), [])
+        self.assertEqual(self.hours(1), ["a.png"])
+
+    def test_time_already_counted_is_not_counted_again(self):
+        self.on()
+        self.put("a.png", age=DAY)
+        self.hours(10)
+        for _ in range(5):
+            self.now -= 3 * HOUR
+            self.hours(1)
+            self.now += 3 * HOUR
+            self.hours(1)
+        self.assertEqual(self.store.get(auto.LEDGER)["files"]["a.png"]["waited"], 19 * HOUR)
 
     def test_one_run_far_in_the_future_does_not_block_later_files(self):
         self.on()
         auto.run(self.store, self.now + 4000 * DAY)
         self.put("a.png")
         auto.run(self.store, self.now + 4000 * DAY)
-        self.assertEqual(self.run_at(HOUR, 6 * DAY), [])
-        self.assertEqual(self.run_at(DAY), ["a.png"])
+        self.assertEqual(self.hours(24), [])
+        self.assertEqual(self.hours(1), ["a.png"])
         self.put("b.png")
-        self.assertEqual(self.run_at(HOUR, 8 * DAY), ["b.png"])
+        self.assertEqual(self.hours(24), [])
+        self.assertEqual(self.hours(1), ["b.png"])
+
+    def test_clock_jumping_ahead_only_counts_a_few_hours(self):
+        self.on()
+        self.put("report.pdf", age=120 * 10**9)
+        self.assertEqual(self.run_at(61 * 10**9, 61 * 10**9, 8 * DAY), [])
+        self.assertEqual(self.store.get(auto.LEDGER)["files"]["report.pdf"]["waited"], 61 * 10**9 + auto.LONGEST_GAP)
+        self.assertEqual(self.run_at(*[30 * DAY] * 4), [])
+        self.assertEqual(self.run_at(30 * DAY), ["report.pdf"])
+
+    def test_a_computer_off_every_night_still_gets_there(self):
+        self.on()
+        self.put("a.png")
+        for day in range(4):
+            self.assertEqual(self.hours(3), [])
+            self.now += 20 * HOUR
+        self.assertEqual(self.hours(1), ["a.png"])
 
     def test_future_date_waits_for_it(self):
         self.on(days=0)
@@ -589,7 +623,8 @@ class Behaviour:
         self.on()
         self.put("a.png")
         self.assertEqual(self.status(), {"available": True, "why": "", "on": True, "next": "within the next hour",
-                                         "waiting": 0, "folder": str(self.folder), "note": ""})
+                                         "waiting": 0, "folder": str(self.folder), "note": "", "summary": (
+            "On. Every hour, new files older than 1 day move to their folder, even when Downkeep is closed.")})
         self.run_at(HOUR)
         self.now += 20 * 60 * 10**9
         self.assertEqual((self.status()["next"], self.status()["waiting"]), ("in about 40 minutes", 1))
@@ -598,6 +633,47 @@ class Behaviour:
         self.schedule.installed_command.return_value = None
         self.assertEqual(self.status()["next"], None)
         self.assertIn("missing", self.status()["note"])
+
+    def test_summary(self):
+        self.assertEqual(self.status()["summary"], "Off. Nothing moves by itself.")
+        for days, own, expected in [
+            (0, [], "new files move to their folder,"), (3, [], "older than 3 days move"),
+            (1, [{"folder": "Cats", "words": ["cat"], "days": 7}], "once they are older than its wait (1 to 7 days),"),
+            (2, [{"folder": "Cats", "words": ["cat"], "days": 0}], "once they are older than its wait (0 to 2 days),"),
+        ]:
+            self.on(*own, days=days)
+            self.assertIn(expected, self.status()["summary"])
+        self.on(days=1, auto=False)
+        self.assertEqual(self.status()["summary"],
+                         "On, but no folder is set to take new files by itself, so nothing moves.")
+        self.store.set(RULES_KEY, "broken")
+        self.assertIn("no folder", self.status()["summary"])
+
+    def test_own_folders_are_automatic_like_the_built_in_ones(self):
+        self.on({"folder": "Bills", "words": ["bill"]})
+        self.put("bill.pdf")
+        self.assertEqual(self.hours(25), ["bill.pdf"])
+        self.assertEqual(self.moved(), ["Bills/bill.pdf"])
+        self.assertTrue(all(rule["days"] == 1 and rule["auto"] for rule in saved_rules(self.store)))
+
+    def test_turning_off_stops_between_two_files(self):
+        self.on(days=0)
+        for number in range(5):
+            self.put(f"{number}.png", age=DAY)
+        self.hours(1)
+        seen = []
+
+        def stopping(store, folder, moves, kind, should_stop):
+            for move in moves:
+                if should_stop():
+                    break
+                seen.append(move.file.name)
+                auto.turn_off(store)
+            return Result()
+
+        with mock.patch("downkeep.auto.engine.apply_moves", stopping):
+            self.hours(1)
+        self.assertEqual(seen, ["0.png"])
 
     @unittest.skipIf(sys.platform in ("win32", "darwin"), "names there are always valid text")
     def test_names_that_are_not_valid_text(self):
@@ -648,6 +724,22 @@ class RealAutoTest(Behaviour, Case):
         self.run_at(HOUR, HOUR)
         self.put_back(1)
         self.assertEqual(self.run_at(HOUR, HOUR, 10 * DAY), [])
+
+    def test_turning_off_stops_the_real_engine_between_two_files(self):
+        self.on(days=0)
+        for number in range(5):
+            self.put(f"{number}.png", age=DAY)
+        self.hours(1)
+        steps = []
+
+        def step(name):
+            if name == "move saved" and not steps:
+                steps.append(name)
+                auto.turn_off(self.store)
+
+        with mock.patch("downkeep.engine._checkpoint", step):
+            self.assertEqual(self.hours(1), ["0.png"])
+        self.assertEqual(len(list(self.folder.glob("*.png"))), 4)
 
     def test_history_says_auto(self):
         self.on(days=0)

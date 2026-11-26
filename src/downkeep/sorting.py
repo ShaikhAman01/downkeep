@@ -63,7 +63,7 @@ _CAMEL = re.compile(r"(?<=[a-z])(?=[A-Z])")
 
 def _default(name, folder, *kinds):
     return {"id": name, "folder": folder, "kinds": list(kinds), "extensions": [], "words": [], "sites": [],
-            "on": True, "auto": True, "days": 7}
+            "on": True, "auto": True, "days": 1}
 
 
 DEFAULT_RULES: list[dict] = [
@@ -356,7 +356,19 @@ def _check_site(value):
 
 MOST_SUGGESTED = 3
 FEWEST_FILES = 3
-PLAIN_HOSTS = frozenset("www www2 m mobile mail web cdn dl download downloads files static media assets".split())
+PLAIN_HOSTS = frozenset("""
+    www www2 m mobile mail web cdn dl download downloads files static media assets lms moodle portal canvas classroom
+    blackboard learn elearning my app apps account accounts login secure docs example
+""".split())
+TEST_ENDINGS = ("test", "example", "invalid", "localhost", "local")
+BRANDS = {"github.com": "GitHub", "githubusercontent.com": "GitHub", "whatsapp.com": "WhatsApp",
+          "whatsapp.net": "WhatsApp", "youtube.com": "YouTube", "linkedin.com": "LinkedIn",
+          "drive.google.com": "Google Drive", "drive.usercontent.google.com": "Google Drive"}
+# Only words that read well with an s; anything else keeps the person's word
+COUNTABLE = frozenset("""
+    invoice receipt bill lecture statement ticket assignment report payslip certificate resume letter form note slide
+    screenshot
+""".split())
 # Screenshot is not here on purpose: a Screenshots folder is one people really want
 STOP_WORDS = frozenset("""
     copy final new file files document documents download downloads image images img pic pics photo photos picture
@@ -383,13 +395,17 @@ def suggest_name(rule: dict) -> str:
 
 
 def _site_name(site):
-    if not isinstance(site, str):
+    if not isinstance(site, str) or ":" in site:
         return None
-    labels = [label for label in site.lower().strip(".").split(".") if label]
-    if len(labels) < 2 or all(label.isdigit() for label in labels) or ":" in site:
+    site = site.lower().strip(".")
+    brand = next((name for host, name in BRANDS.items() if site == host or site.endswith("." + host)), None)
+    labels = [label for label in site.split(".") if label]
+    if brand or len(labels) < 2 or labels[-1] in TEST_ENDINGS or all(label.isdigit() for label in labels):
+        return brand
+    # The first useful label is the name people know: bbc in www.bbc.co.uk, college in lms.college.example.edu
+    useful = [label for label in labels[:-1] if label not in PLAIN_HOSTS]
+    if not useful:
         return None
-    # The first useful label is the name people know: bbc in www.bbc.co.uk, college in college.example.edu
-    useful = [label for label in labels[:-1] if label not in PLAIN_HOSTS] or labels[:-1]
     try:
         main = useful[0].encode("ascii").decode("idna")
     except UnicodeError:
@@ -402,9 +418,7 @@ def _word_name(word):
         return None
     first = word.split()[0]
     named = first[:1].upper() + first[1:]
-    plural = first.isascii() and first.isalpha() and first.islower() and len(first) >= 3
-    plural = plural and not first.endswith(("s", "x", "z", "y", "ch", "sh"))
-    return named + "s" if plural else named
+    return named + "s" if first.lower() in COUNTABLE else named
 
 
 def suggest(
@@ -462,7 +476,7 @@ def _candidates(files, hosts):
     found += [(len(names), "word", word) for word, names in words.items()]
     found = sorted((item for item in found if item[0] >= FEWEST_FILES), key=lambda item: (-item[0], item[1], item[2]))
     for _, kind, value in found[:30]:
-        blank = _default("", "") | {"kinds": [], "auto": False}
+        blank = _default("", "") | {"kinds": []}
         if kind == "site":
             yield blank | {"sites": [value]}, f"{{count}} files came from {value}"
         else:

@@ -1,3 +1,4 @@
+import inspect
 import os
 import time
 from dataclasses import replace
@@ -11,13 +12,16 @@ from downkeep.sorting import RULES_KEY, match, plan, saved_rules
 DAY_NS = 86_400 * 1_000_000_000
 STEADY_NS = 60 * 1_000_000_000
 HOUR_NS = 3_600 * 1_000_000_000
+# Time between two runs counts for at most this much, so a clock that jumps ahead can't make files old. A file
+# waiting N days has been seen by more than N * 6 runs. A computer that is off overnight still gets there, later.
+LONGEST_GAP = 4 * HOUR_NS
 MOST = 200
 MOST_UNDONE = 5000
 NOT_HERE = "Moving files is not available on this system yet"
 
 # Each setting has one writer, so a run and the window never overwrite each other's:
 STATE = "auto"  # turn_on and turn_off: {"on", "folder", "inode", "since"}
-LEDGER = "auto_files"  # turn_on and run, holding the lock: {"folder", "peak", "files": {name: {"left", "inode", ...}}}
+LEDGER = "auto_files"  # turn_on and run, holding the lock: {"folder", "last", "ahead", "files": {name: {"left", "inode", ...}}}
 LOG = "auto_log"  # run: {"last", "waiting", "problem"}
 UNDONE = "auto_undone"  # note_undo: {"names", "strikes": {rule: [batch]}, "stopped": [rule]}
 
@@ -36,12 +40,34 @@ def status(store, folder: str | os.PathLike | None = None) -> dict:
             notes.append("The hourly check is missing. Turn automatic tidying off and on again.")
         elif available:
             upcoming = _next(log.get("last"), time.time_ns())
-    notes += _stopped(store)
+    try:
+        rules = saved_rules(store)
+    except ActionError:
+        rules = []
+    notes += _stopped(rules, (store.get(UNDONE) or {}).get("stopped", ()))
     return {
         "available": available, "why": why, "on": on, "next": upcoming,
         "waiting": log.get("waiting", 0) if on else 0, "folder": state.get("folder") if on else None,
-        "note": " ".join(notes),
+        "note": " ".join(notes), "summary": _summary(on, rules),
     }
+
+
+def _summary(on, rules):
+    if not on:
+        return "Off. Nothing moves by itself."
+    days = sorted({rule["days"] for rule in rules if rule["on"] and rule["auto"]})
+    if not days:
+        return "On, but no folder is set to take new files by itself, so nothing moves."
+    if days[-1] == 0:
+        return "On. Every hour, new files move to their folder, even when Downkeep is closed."
+    if len(days) > 1:
+        return (f"On. Every hour, new files move to their folder once they are older than its wait ({days[0]} to "
+                f"{days[-1]} days), even when Downkeep is closed.")
+    return f"On. Every hour, new files older than {_days(days[0])} move to their folder, even when Downkeep is closed."
+
+
+def _days(count):
+    return "1 day" if count == 1 else f"{count} days"
 
 
 def turn_on(store, folder: str | os.PathLike) -> None:
@@ -86,7 +112,7 @@ def run(store, now_ns: int | None = None) -> Result:
     try:
         moves, rules, log["waiting"] = _choose(store, state, now)
         if moves and store.get(STATE) == state:
-            result = engine.apply_moves(store, state["folder"], moves, "auto")
+            result = _apply(store, state, moves)
             log["waiting"] -= len(result.done)
             if result.batch is not None:
                 store.set(_batch_key(result.batch), {name: rules[name] for name in result.done})
@@ -159,9 +185,18 @@ def _choose(store, state, now):
     return moves[:MOST], {file.name: rule["id"] for file, rule in waiting.items()}, len(waiting)
 
 
+def _apply(store, state, moves):
+    """Stops between two files as soon as automatic tidying is turned off or moved to another folder."""
+    extra = {}
+    if "should_stop" in inspect.signature(engine.apply_moves).parameters:
+        extra["should_stop"] = lambda: store.get(STATE) != state
+    return engine.apply_moves(store, state["folder"], moves, "auto", **extra)
+
+
 def _due(file, entry, days, now):
-    old_enough = min(now - entry["first"], now - file.mtime_ns) >= days * DAY_NS
-    return old_enough and now - entry["same"] >= STEADY_NS
+    """Old enough both by the time Downkeep watched it and by its own date, and unchanged for a minute."""
+    wait = days * DAY_NS
+    return entry["waited"] >= wait and now - file.mtime_ns >= wait and now - entry["same"] >= STEADY_NS
 
 
 def _update(store, snapshot, now):
@@ -173,31 +208,34 @@ def _update(store, snapshot, now):
     before, finished = ledger["files"], {file.name: file for file in snapshot.files}
     left_inodes = {entry["inode"] for entry in before.values() if entry["left"]} - {0}
     undone = set((store.get(UNDONE) or {}).get("names", ()))
-    behind = now < ledger["peak"]
+    # After the clock went back, time already counted once is not counted again
+    last, ahead = ledger["last"], ledger.get("ahead", ledger["last"])
+    gap = min(max(now - (ahead if last < ahead <= now else last), 0), LONGEST_GAP)
+    behind = now < ahead
     files = {}
     for name, inode in _names(snapshot.folder).items():
         entry, file = before.get(name), finished.get(name)
         if (entry and entry["left"]) or inode in left_inodes or name in undone or (file and store.is_left(file)):
             files[name] = {"left": True, "inode": inode}
         elif file:
-            files[name] = _seen(entry, file, now, behind)
-    return {"folder": snapshot.folder, "peak": max(now, ledger["peak"]), "files": files}
+            files[name] = _seen(entry, file, now, gap, behind)
+    return {"folder": snapshot.folder, "last": now, "ahead": max(ahead, now), "files": files}
 
 
 def _all_left(root, now):
     files = {name: {"left": True, "inode": inode} for name, inode in _names(root).items()}
-    return {"folder": root, "peak": now, "files": files}
+    return {"folder": root, "last": now, "ahead": now, "files": files}
 
 
-def _seen(entry, file, now, behind):
-    fresh = {"left": False, "inode": file.inode, "size": file.size, "mtime": file.mtime_ns,
-             "first": now, "same": now, "behind": behind, "tried": 0}
+def _seen(entry, file, now, gap, behind):
     if not entry or entry["inode"] != file.inode:
-        return fresh
-    # Waiting starts again for times noted while the clock was behind, or now in the future (same is never before first)
-    if entry["same"] > now or (entry["behind"] and not behind):
-        return fresh
-    if (entry["size"], entry["mtime"]) != (file.size, file.mtime_ns):
+        return {"left": False, "inode": file.inode, "size": file.size, "mtime": file.mtime_ns,
+                "waited": 0, "same": now, "tried": 0, "behind": behind}
+    # First seen while the clock was behind: the time back to the last good check may be from before it came
+    counted = 0 if entry["behind"] and not behind else gap
+    entry = entry | {"waited": entry["waited"] + counted, "behind": entry["behind"] and behind}
+    # A clock that went back would make the file look steady for longer than it was
+    if (entry["size"], entry["mtime"]) != (file.size, file.mtime_ns) or entry["same"] > now:
         return entry | {"size": file.size, "mtime": file.mtime_ns, "same": now}
     return entry
 
@@ -229,12 +267,9 @@ def _stop(store, rule):
     store.set(RULES_KEY, [item | {"auto": item["auto"] and item["id"] != rule} for item in rules])
 
 
-def _stopped(store):
-    stopped = (store.get(UNDONE) or {}).get("stopped", ())
-    if not stopped:
-        return []
+def _stopped(rules, stopped):
     return [f"New files no longer go to {rule['folder']} by themselves, because you undid that twice."
-            for rule in saved_rules(store) if rule["id"] in stopped and rule["on"] and not rule["auto"]]
+            for rule in rules if rule["id"] in stopped and rule["on"] and not rule["auto"]]
 
 
 # Words for the person
