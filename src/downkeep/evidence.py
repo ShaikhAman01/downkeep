@@ -69,6 +69,27 @@ def find_extracted(files: Iterable[FileRecord], folder: str) -> list[Extracted]:
     return sorted(found, key=lambda item: (-item.archive.size, item.archive.name))
 
 
+def verify_copy(file: FileRecord, other: FileRecord) -> tuple[str, ...]:
+    """Reads both again in full. The files that must stay for this proof to hold, or () if it doesn't."""
+    if (file.device, file.inode) == (other.device, other.inode):
+        return ()
+    return (other.path,) if _same((file, other), _hash) else ()
+
+
+def verify_extracted(item: Extracted) -> tuple[str, ...]:
+    """Reads the zip's listing and every extracted file again. The files that must stay, or ()."""
+    members = _members(item.archive) or {}
+    wanted = {os.path.join(item.folder, *parts): value for parts, value in members.items()}
+    # A link anywhere on the way would make a file outside the folder count as proof
+    if any(os.path.realpath(place) != place for place in wanted):
+        return ()
+    return tuple(wanted) if all(_checksum(place, size) == crc for place, (size, crc) in wanted.items()) else ()
+
+
+def is_trash(name: str) -> bool:
+    return name == ".Trash" or name.startswith(".Trash-") or name.lower() == "$recycle.bin"
+
+
 def _one_per_inode(files):
     return list({(file.device, file.inode): file for file in files}.values())
 
@@ -140,6 +161,9 @@ def _members(archive):
                     entries = opened.infolist()
     except (Changed, OSError, ValueError, NotImplementedError, zipfile.BadZipFile, struct.error):
         return None
+    # Anything in front of the first file, such as another zip, is not in this listing
+    if entries and min(entry.header_offset for entry in entries) != 0:
+        return None
     members = {}
     for entry in entries:
         if entry.is_dir() or entry.filename.startswith("__MACOSX/"):
@@ -170,7 +194,7 @@ def _small_directory(stream, size):
 def _index(folder):
     sizes = {}
     for parent, folders, names in os.walk(folder):
-        folders[:] = sorted(name for name in folders if name not in NEVER_ENTER)
+        folders[:] = sorted(name for name in folders if name not in NEVER_ENTER and not is_trash(name))
         for name in sorted(names):
             path = os.path.join(parent, name)
             try:
