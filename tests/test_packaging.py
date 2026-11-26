@@ -35,6 +35,19 @@ glibc = load("glibc")
 smoke = load("smoke")
 
 
+class WorkflowYamlTest(unittest.TestCase):
+    def test_plain_values_have_no_colon_space(self):
+        # YAML reads ": " inside an unquoted value as a new key, and GitHub then ignores the whole file
+        for path in sorted(Path(__file__).parent.parent.joinpath(".github", "workflows").glob("*.yml")):
+            for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                key, colon, value = line.strip().removeprefix("- ").partition(": ")
+                value = value.split(" #")[0].strip()
+                if colon and value and value[0] not in "\"'|>[{&*!":
+                    with self.subTest(file=path.name, line=number):
+                        self.assertNotIn(": ", value)
+                        self.assertFalse(value.endswith(":"))
+
+
 class VersionTest(unittest.TestCase):
     def test_one_version_everywhere(self):
         project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
