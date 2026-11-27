@@ -394,7 +394,10 @@ def _folder_identity(path):
 
 def _born_ns(path, info=None):
     if sys.platform == "win32":
-        return getattr(info or os.lstat(path), "st_birthtime_ns", None)
+        try:
+            return getattr(info or os.lstat(path), "st_birthtime_ns", None)
+        except OSError:
+            return None
     statx = _statx_function()
     if statx is None:
         return None

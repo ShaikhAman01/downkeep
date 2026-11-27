@@ -219,7 +219,7 @@ def _update(store, snapshot, now):
             files[name] = {"left": True, "inode": inode}
         elif file:
             files[name] = _seen(entry, file, now, gap, behind)
-    return {"folder": snapshot.folder, "last": now, "ahead": max(ahead, now), "files": files}
+    return {"folder": snapshot.folder, "last": now, "ahead": ahead + gap if behind else now, "files": files}
 
 
 def _all_left(root, now):

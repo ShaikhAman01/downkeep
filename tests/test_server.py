@@ -463,7 +463,7 @@ class PageTest(unittest.TestCase):
             with open(script, "w", encoding="utf-8") as file:
                 file.write(FAKE_PAGE % body)
             page = str(files("downkeep").joinpath("page"))
-            done = subprocess.run(["node", script, page], capture_output=True, text=True, timeout=60, cwd=folder)
+            done = subprocess.run(["node", script, page], capture_output=True, text=True, encoding="utf-8", timeout=60, cwd=folder)
         self.assertEqual(done.returncode, 0, done.stderr)
         return json.loads(done.stdout.strip().splitlines()[-1])
 

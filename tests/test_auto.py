@@ -433,6 +433,16 @@ class Behaviour:
             self.hours(1)
         self.assertEqual(self.store.get(auto.LEDGER)["files"]["a.png"]["waited"], 19 * HOUR)
 
+    def test_time_counted_while_behind_is_not_counted_again_when_the_clock_is_fixed(self):
+        self.on()
+        self.put("a.png", age=DAY)
+        self.hours(10)
+        self.now -= 3 * HOUR
+        self.hours(2)
+        self.now += 3 * HOUR
+        self.hours(1)
+        self.assertEqual(self.store.get(auto.LEDGER)["files"]["a.png"]["waited"], 12 * HOUR)
+
     def test_one_run_far_in_the_future_does_not_block_later_files(self):
         self.on()
         auto.run(self.store, self.now + 4000 * DAY)
@@ -766,7 +776,7 @@ class Month:
     def __init__(self, case, seed):
         self.case, self.random = case, random.Random(seed)
         self.old, self.undone, self.growing = set(), set(), {}
-        self.arrived, self.changed, self.count, self.seen = {}, {}, 0, set()
+        self.arrived, self.changed, self.renamed, self.count, self.seen = {}, {}, {}, 0, set()
 
     def live(self, hours, days=7):
         case = self.case
@@ -837,6 +847,7 @@ class Month:
             if self.random.random() < 0.3:
                 name = self.growing.pop(token)
                 (self.case.folder / (name + ".part")).rename(self.case.folder / name)
+                self.renamed[token] = self.case.now
                 self.arrived[token] = self.case.now if token not in self.old else 0
 
     def pick(self):
@@ -848,7 +859,7 @@ class Month:
         if not path:
             return
         token, when = self.token(path), self.random.choice([self.case.now - 600 * 10**9, self.case.now])
-        if self.random.random() < 0.5:
+        if self.random.random() < 0.5 and self.renamed.get(token, 0) < self.case.now - 2 * HOUR:
             self.write("save.tmp", token, b"atomic %d" % self.random.randint(1, 999), when)
             (self.case.folder / "save.tmp").replace(path)
         else:
@@ -858,6 +869,7 @@ class Month:
         path = self.pick()
         # A whole-file save and a rename within one hour can't be told from a new file
         if path and self.changed[self.token(path)] < self.case.now - 2 * HOUR:
+            self.renamed[self.token(path)] = self.case.now
             path.rename(path.with_name(f"renamed {self.count} {self.random.randint(1, 10**9)}{path.suffix}"))
 
     def check(self, result):

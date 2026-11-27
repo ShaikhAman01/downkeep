@@ -64,6 +64,7 @@ def find_duplicates(files: Iterable[FileRecord], keepers: Iterable[FileRecord] =
 def find_keepers(folder: str, names: Iterable[str]) -> list[FileRecord]:
     """Files directly inside these subfolders, named "Documents/a.pdf". Links and other disks are left out."""
     found = []
+    folder = os.path.realpath(folder)
     device = os.stat(folder).st_dev
     for name in dict.fromkeys(name for name in names if isinstance(name, str)):
         if name in ("", ".", "..") or set(name) & {"/", "\\", "\0"} or is_trash(name):
@@ -71,7 +72,7 @@ def find_keepers(folder: str, names: Iterable[str]) -> list[FileRecord]:
         path = os.path.join(folder, name)
         try:
             info = os.lstat(path)
-            if not stat.S_ISDIR(info.st_mode) or os.path.realpath(path) != path or info.st_dev != device:
+            if not stat.S_ISDIR(info.st_mode) or os.path.normcase(os.path.realpath(path)) != os.path.normcase(path) or info.st_dev != device:
                 continue
             files = scan(path).files
         except (OSError, ScanError):

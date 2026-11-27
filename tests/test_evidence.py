@@ -598,8 +598,20 @@ class KeepersTest(FolderTest):
 
         with mock.patch("downkeep.evidence.os.lstat", elsewhere):
             self.assertEqual(self.keep_in("Documents"), [])
-        with mock.patch("downkeep.evidence.os.path.realpath", lambda path: path + "x"):
+        with mock.patch("downkeep.evidence.os.path.realpath", lambda path: path + "x" if path.endswith("Documents") else path):
             self.assertEqual(self.keep_in("Documents"), [])
+
+    def test_a_folder_reached_through_a_link_still_has_keepers(self):
+        (self.folder / "Documents").mkdir()
+        self.add("Documents/a.txt", b"same")
+        self.symlink("Linked", self.folder / "Documents")
+        through = self.folder.parent / "through"
+        try:
+            through.symlink_to(self.folder)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks are not allowed here")
+        found = find_keepers(str(through), ["Documents", "Linked"])
+        self.assertEqual([(file.name, file.path) for file in found], [("Documents/a.txt", str(self.folder / "Documents" / "a.txt"))])
 
     def test_a_hard_link_in_a_subfolder_is_not_a_copy(self):
         (self.folder / "Documents").mkdir()
