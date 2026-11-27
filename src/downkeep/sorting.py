@@ -1,7 +1,9 @@
+import getpass
 import os
 import re
 import unicodedata
-from collections.abc import Callable, Mapping, Sequence
+from collections import Counter
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from functools import lru_cache
 
 from downkeep.model import ActionError, Move, Stay
@@ -356,6 +358,8 @@ def _check_site(value):
 
 MOST_SUGGESTED = 3
 FEWEST_FILES = 3
+SHORTEST_WORD = 4
+MOSTLY = 0.8
 PLAIN_HOSTS = frozenset("""
     www www2 m mobile mail web cdn dl download downloads files static media assets lms moodle portal canvas classroom
     blackboard learn elearning my app apps account accounts login secure docs example
@@ -363,7 +367,8 @@ PLAIN_HOSTS = frozenset("""
 TEST_ENDINGS = ("test", "example", "invalid", "localhost", "local")
 BRANDS = {"github.com": "GitHub", "githubusercontent.com": "GitHub", "whatsapp.com": "WhatsApp",
           "whatsapp.net": "WhatsApp", "youtube.com": "YouTube", "linkedin.com": "LinkedIn",
-          "drive.google.com": "Google Drive", "drive.usercontent.google.com": "Google Drive"}
+          "drive.google.com": "Google Drive", "drive.usercontent.google.com": "Google Drive",
+          "chatgpt.com": "ChatGPT", "mail.google.com": "Gmail", "mail-attachment.googleusercontent.com": "Gmail"}
 # Only words that read well with an s; anything else keeps the person's word
 COUNTABLE = frozenset("""
     invoice receipt bill lecture statement ticket assignment report payslip certificate resume letter form note slide
@@ -377,7 +382,19 @@ STOP_WORDS = frozenset("""
     macos amd arm the and for with from your our you this that are was not all page pages part dsc pxl wa
     january february march april may june july august september october november december
     jan feb mar apr jun jul aug sep sept oct nov dec monday tuesday wednesday thursday friday saturday sunday
+    preview previews removebg nobg compressed compress resized resize cropped crop converted optimized optimised
+    exported thumb thumbnail thumbnails watermark watermarked merged rotated enhanced upscaled original orig
+    modified updated revised fixed copia kopie lowres hires small large medium unnamed noname
 """.split())
+WEB_WORDS = frozenset("com org net edu gov int mil info biz io co in uk us ac www http https ftp mailto html htm php".split())
+_LABEL = r"(?:[^\W_]|-)+"
+_WEB = re.compile(rf"""
+    (?:https?|ftp)://\S* | mailto:\S*
+  | (?:[^\W_]|[.+])+@{_LABEL}(?:\.{_LABEL})+
+  | (?:{_LABEL}\.)+(?:com|net|org|edu|gov|io|info|biz|(?:co|ac|com|org|net|edu|gov)\.[a-z]{{2}})(?![^\W_])
+  | www\d?(?:\.{_LABEL})+
+""", re.I | re.X)
+_ID_PART = re.compile(r"(?:^|-)\d{5,}(?:-|$)")
 _TOKEN = re.compile(r"[^\W\d_]+")
 
 
@@ -404,7 +421,7 @@ def _site_name(site):
         return brand
     # The first useful label is the name people know: bbc in www.bbc.co.uk, college in lms.college.example.edu
     useful = [label for label in labels[:-1] if label not in PLAIN_HOSTS]
-    if not useful:
+    if not useful or _ID_PART.search(useful[0]):
         return None
     try:
         main = useful[0].encode("ascii").decode("idna")
@@ -426,10 +443,13 @@ def suggest(
     rules: Sequence[dict],
     hosts: Mapping[str, str] | None = None,
     look: Callable[[str], Mapping[str, bool]] = look_in,
+    own_names: Iterable[str] | None = None,
 ) -> list[dict]:
-    """Up to three new folders worth having here, the ones covering the most files first. Reads names only."""
+    """Up to three new folders worth having here, the ones covering the most files first. Reads names only.
+    own_names are the person's own names, never suggested; by default they come from the account."""
     hosts = hosts or {}
     files = snapshot.files
+    person = _name_words(_account_names() if own_names is None else own_names)
     try:
         taken = {same(name) for name in look(snapshot.folder)}
     except OSError:
@@ -437,19 +457,28 @@ def suggest(
     taken |= {same(rule["folder"]) for rule in rules}
     ids = {rule["id"] for rule in rules}
     chosen = []
-    for rule, why in _candidates(files, hosts):
+    for rule, why in _candidates(files, hosts, person):
         covered = frozenset(
             file.name for file in files if _why(file.name, rule, hosts.get(file.path), _pretends(file.name))
         )
         own = {_own_folder(file, rules, hosts) for file in files if file.name in covered}
         if len(covered) < FEWEST_FILES or (len(own) == 1 and None not in own):
             continue
+        splits = bool(rule["words"]) and _only_splits_a_type(
+            rule["words"][0], [file for file in files if file.name in covered], rules, hosts)
         rule = rule | {"folder": suggest_name(rule)}
-        chosen.append((len(covered), rule, why, covered))
+        chosen.append((len(covered), rule, why, covered, splits))
     chosen.sort(key=lambda item: (-item[0], same(item[1]["folder"]), item[2]))
-    found = []
-    for count, rule, why, covered in chosen:
-        if same(rule["folder"]) in taken or any(covered <= other for _, other in found):
+    found, claimed, split = [], [], []
+    for count, rule, why, covered, splits in chosen:
+        # Mostly the files of a bigger suggestion, or for words, of a bigger word that only split a type: chill in lofi
+        others = claimed + split if rule["words"] else claimed
+        if any(len(covered & other) >= MOSTLY * count for other in others):
+            continue
+        if splits:
+            split.append(covered)
+            continue
+        if same(rule["folder"]) in taken:
             continue
         taken.add(same(rule["folder"]))
         try:
@@ -457,20 +486,21 @@ def suggest(
         except ActionError:
             continue
         ids.add(rule["id"])
-        found.append(({"folder": rule["folder"], "why": why.format(count=count), "rule": rule, "files": count}, covered))
+        claimed.append(covered)
+        found.append({"folder": rule["folder"], "why": why.format(count=count), "rule": rule, "files": count})
         if len(found) == MOST_SUGGESTED:
             break
-    return [item for item, _ in found]
+    return found
 
 
-def _candidates(files, hosts):
+def _candidates(files, hosts, person=frozenset()):
     """Sites and words seen in at least three files, most common first, as rules and reasons."""
     sites, words = {}, {}
     for file in files:
         host = hosts.get(file.path)
         if host and _site_name(host):
             sites.setdefault(host.removeprefix("www."), set()).add(file.name)
-        for word in _words(file.name):
+        for word in _words(file.name, person):
             words.setdefault(word, set()).add(file.name)
     found = [(len(names), "site", site) for site, names in sites.items()]
     found += [(len(names), "word", word) for word, names in words.items()]
@@ -483,13 +513,69 @@ def _candidates(files, hosts):
             yield blank | {"words": [value]}, f"{{count}} files have {value} in the name"
 
 
-def _words(name):
+def _words(name, person=frozenset()):
     tokens = set()
-    for text in _texts(name):
+    for text in _texts(_WEB.sub(" ", name)):
         for token in _TOKEN.findall(text):
-            if len(token) >= 3 and token not in STOP_WORDS and token not in _KIND and _not_private(token):
+            if (len(token) >= SHORTEST_WORD and token not in STOP_WORDS and token not in WEB_WORDS
+                    and token not in _KIND and token not in person and _not_private(token)):
                 tokens.add(token)
     return tokens
+
+
+def _only_splits_a_type(word, files, rules, hosts):
+    """A word only splits up a built-in folder when nearly all its files go to that same one anyway.
+    Documents is left out: papers are what people sort by topic, and it holds slides and sheets too."""
+    if word in COUNTABLE:
+        return False
+    built_in = Counter()
+    for file in files:
+        found = match(file, rules, hosts.get(file.path))
+        if found and found[0]["id"] in _DEFAULT_IDS and found[0]["id"] != "documents":
+            built_in[found[0]["id"]] += 1
+    return bool(built_in) and built_in.most_common(1)[0][1] >= MOSTLY * len(files)
+
+
+def _account_names():
+    names = []
+    if os.name == "nt":
+        names += [os.environ.get("USERNAME", ""), _windows_display_name()]
+    else:
+        try:
+            import pwd
+
+            entry = pwd.getpwuid(os.getuid())
+            names += [entry.pw_name, entry.pw_gecos.split(",")[0]]
+        except (ImportError, KeyError, OSError, AttributeError):
+            pass
+    try:
+        names.append(getpass.getuser())
+    except (ImportError, KeyError, OSError):
+        pass
+    return names
+
+
+def _windows_display_name():
+    try:
+        import ctypes
+
+        size = ctypes.c_ulong(0)
+        get = ctypes.windll.secur32.GetUserNameExW
+        get(3, None, ctypes.byref(size))
+        buffer = ctypes.create_unicode_buffer(size.value + 1)
+        return buffer.value if get(3, buffer, ctypes.byref(size)) else ""
+    except (ImportError, AttributeError, OSError, ValueError):
+        return ""
+
+
+def _name_words(names):
+    """Each part of each name, and the parts joined, as _words would see them."""
+    found = set()
+    for name in names:
+        if isinstance(name, str):
+            parts = _TOKEN.findall(_plain(_CAMEL.sub(" ", name)))
+            found.update(parts, ["".join(parts)] if parts else [])
+    return frozenset(found)
 
 
 def _not_private(token):

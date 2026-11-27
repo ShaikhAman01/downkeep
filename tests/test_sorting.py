@@ -2,6 +2,8 @@ import copy
 import json
 import os
 import random
+import sys
+import types
 import unittest
 from unittest import mock
 
@@ -393,6 +395,8 @@ class SuggestNameTest(unittest.TestCase):
             ({"extensions": ["tar.gz"]}, "TAR.GZ files"), ({"words": ["con"]}, "New folder"), ({"words": ["CON"]}, "New folder"),
             ({"words": ["a/b"]}, "New folder"), ({"words": ["x" * 70]}, "New folder"), ({}, "New folder"),
             ({"sites": [None], "words": [5]}, "New folder"),
+            ({"sites": ["chatgpt.com"]}, "ChatGPT"), ({"sites": ["mail-attachment.googleusercontent.com"]}, "Gmail"),
+            ({"sites": ["app-companion-430619.appspot.com"]}, "New folder"), ({"sites": ["shop-2024.example.com"]}, "Shop-2024"),
         ]:
             with self.subTest(given=given):
                 self.assertEqual(sorting.suggest_name(given), expected)
@@ -407,8 +411,8 @@ class SuggestNameTest(unittest.TestCase):
 
 
 class SuggestTest(unittest.TestCase):
-    def suggested(self, names, own=(), hosts=None, disk=None):
-        return sorting.suggest(snapshot(*names), rules(*own), hosts, look(**(disk or {})))
+    def suggested(self, names, own=(), hosts=None, disk=None, own_names=()):
+        return sorting.suggest(snapshot(*names), rules(*own), hosts, look(**(disk or {})), own_names)
 
     def test_sites_and_words(self):
         names = [f"Invoice {n}.pdf" for n in range(4)] + [f"notes {n}.pdf" for n in range(3)] + ["x.png", "y.png"]
@@ -503,3 +507,114 @@ class SuggestTest(unittest.TestCase):
             raise PermissionError
 
         self.assertEqual(len(sorting.suggest(snapshot(*[f"bill {n}.pdf" for n in range(3)]), rules(), None, nothing)), 1)
+
+
+class TrustedSuggestionTest(unittest.TestCase):
+    def suggested(self, names, own=(), hosts=None, own_names=(), defaults=DEFAULT_RULES):
+        return sorting.suggest(snapshot(*names), check_rules([*own, *defaults]), hosts, look(), own_names)
+
+    def folders(self, *args, **kwargs):
+        return [item["folder"] for item in self.suggested(*args, **kwargs)]
+
+    def test_web_addresses_and_emails_are_never_words(self):
+        for names in ([f"{n}(chosic.com).zzz" for n in "abc"], [f"key {n} someone@gmail.com.zzz" for n in "abc"],
+                      [f"page {n} https www.example.org.zzz" for n in "abc"], [f"x{n}_mailto_http.zzz" for n in "abc"],
+                      [f"{n} www.shop.co.uk.zzz" for n in "abc"], [f"{n} socket.io.zzz" for n in "abc"]):
+            with self.subTest(names=names):
+                self.assertEqual(self.suggested(names), [])
+        for word in sorted(sorting.WEB_WORDS):
+            self.assertEqual(sorting._words(f"{word} notes.pdf"), {"notes"})
+        self.assertEqual(sorting._words("Invoice_acme.co.in_comics.pdf"), {"invoice", "comics"})
+        self.assertEqual(self.folders([f"comics {n}.zzz" for n in "abc"]), ["Comics"])
+
+    def test_editing_and_export_suffixes_are_never_words(self):
+        for word in ("preview", "removebg", "copy", "final", "edited", "compressed", "resized", "scan", "scanned",
+                     "export", "exported", "download", "untitled", "new", "draft", "cropped", "thumbnail", "original"):
+            with self.subTest(word=word):
+                self.assertEqual(self.suggested([f"{word} {n}.zzz" for n in range(4)]), [])
+        self.assertEqual(self.suggested([f"IMG_2025010{n}-removebg-preview.zzz" for n in range(4)]), [])
+
+    def test_own_name_is_never_a_word(self):
+        names = ["10th_Marksheet_Doe_Jane.pdf", "12th_Marksheet_Doe_Jane.pdf", "Id_Card_Doe_Jane.jpg",
+                 "Certificate_Doe_Jane.pdf", "Passport-JaneDoe.png", "jdoe-notes.txt"]
+        self.assertTrue({"Doe", "Jane"} & set(self.folders(names)))
+        self.assertEqual(self.folders(names, own_names=["Jane Doe", "jdoe"]), [])
+        self.assertEqual(sorting._name_words(["Jane Doe", "", None, "JaneDoe"]), {"jane", "doe", "janedoe"})
+
+    def test_own_name_comes_from_the_account(self):
+        names = [f"Report_Doe_Jane_{n}.zzz" for n in range(3)] + [f"jdoe stuff {n}.zzz" for n in range(4)]
+        entry = types.SimpleNamespace(pw_name="jdoe", pw_gecos="Jane Doe,,,")
+        fake_pwd = types.SimpleNamespace(getpwuid=lambda uid: entry)
+        with mock.patch.object(sorting.os, "name", "posix"), mock.patch.object(sorting.os, "getuid", lambda: 7, create=True), \
+                mock.patch.dict(sys.modules, {"pwd": fake_pwd}), mock.patch.object(sorting.getpass, "getuser", lambda: "jdoe"):
+            self.assertEqual(sorted(sorting._account_names()), ["Jane Doe", "jdoe", "jdoe"])
+            self.assertEqual(self.folders(names, own_names=None), ["Stuff", "Reports"])
+        with mock.patch.object(sorting.os, "name", "nt"), mock.patch.dict(sorting.os.environ, {"USERNAME": "jdoe"}), \
+                mock.patch.object(sorting, "_windows_display_name", lambda: "Jane Doe"), \
+                mock.patch.object(sorting.getpass, "getuser", lambda: "jdoe"):
+            self.assertEqual(self.folders(names, own_names=None), ["Stuff", "Reports"])
+
+    def test_no_account_name_fails_quietly(self):
+        def broken(*args):
+            raise KeyError("no such user")
+
+        def no_user():
+            raise OSError("no user name")
+
+        with mock.patch.object(sorting.os, "name", "posix"), mock.patch.object(sorting.os, "getuid", lambda: 7, create=True), \
+                mock.patch.dict(sys.modules, {"pwd": types.SimpleNamespace(getpwuid=broken)}), \
+                mock.patch.object(sorting.getpass, "getuser", no_user):
+            self.assertEqual(sorting._account_names(), [])
+            self.assertEqual(self.folders([f"Report {n}.pdf" for n in range(3)], own_names=None), ["Reports"])
+        with mock.patch.object(sorting.os, "name", "nt"), mock.patch.dict(sorting.os.environ, clear=True), \
+                mock.patch.object(sorting.getpass, "getuser", no_user):
+            self.assertIsInstance(sorting._account_names(), list)
+
+    def test_words_that_only_split_a_built_in_folder_are_skipped(self):
+        music = ["lofi-chill-rain.mp3", "lofi-chill-beat.mp3", "lofi-chill-night.mp3", "lofi-cozy-cafe.mp3",
+                 "lofi-cozy-snow.mp3", "lofi-cozy-tea.mp3", "lofi-chill-license.txt"]
+        self.assertEqual(self.suggested(music), [])
+        self.assertEqual(self.suggested([f"home-{n}-dark.png" for n in range(5)]), [])
+        self.assertEqual(self.suggested([f"wedding {n}.jpg" for n in range(5)]), [])
+        self.assertEqual(self.folders([f"Screenshot {n}.png" for n in range(3)]), ["Screenshots"])
+        music_off = check_rules([rule["id"] == "music" and {**rule, "on": False} or rule for rule in DEFAULT_RULES])
+        self.assertEqual(self.folders(music, defaults=music_off), ["Lofi"])
+
+    def test_topics_across_kinds_stay(self):
+        self.assertEqual(self.folders(["wedding 1.jpg", "wedding 2.jpg", "wedding guests.xlsx", "wedding.mp4"]), ["Wedding"])
+        self.assertEqual(self.folders(["CS50 Lecture 1.pdf", "cs50 lecture 2.pptx", "Lecture 3 notes.docx"]), ["Lectures"])
+        self.assertEqual(self.folders([f"physics {n}.pdf" for n in range(3)]), ["Physics"])
+
+    def test_sites_are_kept_even_for_one_kind(self):
+        names = [f"photo {n}.jpg" for n in range(4)]
+        hosts = {os.path.join("/d", name): "web.whatsapp.com" for name in names}
+        self.assertEqual(self.folders(names, hosts=hosts), ["WhatsApp"])
+        hosts = {os.path.join("/d", name): "app-companion-430619.appspot.com" for name in names}
+        self.assertEqual(self.folders(names, hosts=hosts), [])
+
+    def test_stronger_bar(self):
+        self.assertEqual(self.suggested([f"tax {n}.zzz" for n in range(5)]), [])
+        self.assertEqual(self.folders([f"taxes {n}.zzz" for n in range(3)]), ["Taxes"])
+        self.assertEqual(self.suggested([f"taxes {n}.zzz" for n in range(2)]), [])
+        names = [f"garden rose {n}.zzz" for n in range(4)] + ["rose.zzz", "garden 1.zzz", "garden 2.zzz"]
+        self.assertEqual(self.folders(names), ["Garden"])
+
+    def test_regression_names_like_a_real_downloads_folder(self):
+        names = [f"Song-Title-{n}(chosic.com).mp3" for n in "abc"] + [
+            "Some-Recovery-Key_2026-04-28_someone@gmail.com.pdf",
+            *[f"IMG_2025010{n}_1234-removebg-preview.png" for n in range(4)],
+            "10th_Marksheet_Doe_Jane.pdf", "12th_Marksheet_Doe_Jane.pdf", "Id_Card_Doe_Jane.jpg", "Certificate_Doe_Jane.pdf",
+            *[f"lofi-chill-{n}.mp3" for n in range(3)], *[f"lofi-cozy-{n}.mp3" for n in range(3)],
+            "Lecture 1 slides.pptx", "Lecture 2.pdf", "lecture-3-recording.mp4",
+            "Invoice March.pdf", "invoice-april.png", "Invoice_May.pdf", "invoice june.pdf",
+            *[f"chat photo {n}.jpg" for n in range(3)],
+        ]
+        hosts = {os.path.join("/d", f"chat photo {n}.jpg"): "web.whatsapp.com" for n in range(3)}
+        found = self.suggested(names, hosts=hosts, own_names=["Jane Doe"])
+        self.assertEqual([item["folder"] for item in found], ["Invoices", "Lectures", "WhatsApp"])
+        self.assertEqual(found[0]["rule"]["words"], ["invoice"])
+        self.assertEqual(found[2]["rule"]["sites"], ["web.whatsapp.com"])
+        with mock.patch.object(sorting, "MOST_SUGGESTED", 50):
+            every = {item["folder"].casefold() for item in self.suggested(names, hosts=hosts, own_names=["Jane Doe"])}
+        self.assertFalse(every & {"com", "chosic", "gmail", "someone", "doe", "jane", "preview", "removebg", "chill",
+                                  "cozy", "lofi", "title", "song"}, every)
