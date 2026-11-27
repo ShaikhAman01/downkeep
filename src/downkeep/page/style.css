@@ -79,7 +79,9 @@ h1:focus, h2:focus { outline: none; }
 
 .top { display: flex; align-items: center; justify-content: space-between; min-height: 2rem; }
 
-.name { font-weight: 700; }
+.name { display: flex; align-items: center; gap: 0.55rem; font-weight: 700; }
+
+.logo { flex: none; width: 1.625rem; height: 1.625rem; }
 
 .fresh { margin-top: 0.6rem; padding: 0.45rem 0.7rem; border-radius: 8px; background: var(--pick); color: var(--ink); font-size: 0.9375rem; }
 
@@ -299,6 +301,22 @@ h1:focus, h2:focus { outline: none; }
 
 .suggest .soft { font-size: 0.875rem; }
 
+.suggest-acts { display: flex; flex-wrap: wrap; align-items: center; gap: 0.25rem 0.5rem; }
+
+.suggest .named-row { display: flex; flex-wrap: wrap; align-items: center; gap: 0 0.4rem; }
+
+.suggest .rename { margin-left: -0.1rem; font-size: 0.875rem; color: var(--on-soft); }
+
+.suggest .folder-name { width: min(100%, 18rem); min-height: 2.25rem; }
+
+.suggest .problem { margin-top: 0.2rem; font-size: 0.875rem; }
+
+.suggest .problem:empty { display: none; }
+
+.add-all { min-height: 2.25rem; padding: 0.3rem 0.85rem; border: 0; border-radius: 8px; background: var(--veil); color: var(--on); font-weight: 650; }
+
+.add-all:disabled { opacity: 0.6; cursor: default; }
+
 .text.add { font-weight: 600; }
 
 .warn { grid-column: 3 / -1; display: flex; align-items: flex-start; gap: 0.45rem; color: var(--sun); font-size: 0.875rem; font-weight: 600; }
@@ -347,15 +365,17 @@ input[type="checkbox"]:checked { border-color: var(--sun); background: var(--sun
 
 input[type="checkbox"]:checked::after { content: ""; width: 0.36rem; height: 0.62rem; margin-top: -0.12rem; border: solid var(--sun-ink); border-width: 0 2.5px 2.5px 0; transform: rotate(45deg); }
 
-.switch { flex: none; width: 3rem; height: 1.75rem; padding: 0.2rem; border: 0; border-radius: 1rem; background: #ffffff33; transition: background-color 160ms var(--ease-out); }
+.switch { flex: none; width: 3rem; height: 1.75rem; padding: 0.2rem; border: 0; border-radius: 1rem; background: #ffffff33; transition: background-color 160ms var(--ease-out), transform 120ms var(--ease-out), opacity 200ms var(--ease-out); }
 
-.switch i { display: block; width: 1.35rem; height: 1.35rem; border-radius: 50%; background: var(--on); transition: transform 160ms var(--ease-out); }
+.switch:active:not(:disabled) { transform: scale(0.97); }
+
+.switch i { display: block; width: 1.35rem; height: 1.35rem; border-radius: 50%; background: var(--on); transition: transform 160ms var(--ease-out), background-color 160ms var(--ease-out); }
 
 .switch[aria-checked="true"] { background: var(--sun); }
 
 .switch[aria-checked="true"] i { background: var(--sun-ink); transform: translateX(1.25rem); }
 
-.switch:disabled { opacity: 0.6; cursor: default; }
+.switch:disabled { opacity: 0.6; cursor: not-allowed; }
 
 .autos { margin-top: 1.1rem; }
 
@@ -364,6 +384,18 @@ input[type="checkbox"]:checked::after { content: ""; width: 0.36rem; height: 0.6
 .autos li > div { min-width: 0; }
 
 .autos b { font-weight: 650; overflow-wrap: anywhere; }
+
+.autos .waiting { margin-top: 0.9rem; padding-bottom: 0.5rem; }
+
+.folders select { transition: opacity 200ms var(--ease-out); }
+
+.folders.dim :is(.switch, select) { opacity: 0.5; cursor: not-allowed; }
+
+.folders.waking li:nth-child(2) :is(.switch, select) { transition-delay: 40ms; }
+
+.folders.waking li:nth-child(3) :is(.switch, select) { transition-delay: 80ms; }
+
+.folders.waking li:nth-child(n+4) :is(.switch, select) { transition-delay: 120ms; }
 
 .autos .now { margin-bottom: 1.1rem; padding: 0.75rem 0.9rem; border-radius: 9px; background: var(--veil); overflow-wrap: anywhere; }
 
@@ -376,6 +408,8 @@ option { background: var(--sheet); color: var(--sheet-ink); }
 .problem { margin: 0.4rem 0 0; color: #ffd9a8; font-size: 0.9375rem; overflow-wrap: anywhere; }
 
 .problem:empty { display: none; }
+
+.rules .lead { margin-top: 1rem; padding: 0.6rem 0.85rem; border-radius: 9px; background: var(--veil); font-size: 0.9375rem; }
 
 .rules h3 { margin: 1.4rem 0 0.4rem; font-size: 1.0625rem; }
 
@@ -418,6 +452,24 @@ fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
 .kind { display: flex; align-items: center; gap: 0.6rem; min-height: 2.25rem; cursor: pointer; }
 
 .plain .stage > .why + .acts { margin-top: 1.4rem; }
+
+.farewell { display: flex; flex: 1; flex-direction: column; align-items: center; justify-content: center; padding: 1.5rem 0 2rem; text-align: center; }
+
+.farewell .badge { display: grid; place-items: center; margin-bottom: 1.6rem; padding: 18px; border: 1px solid var(--veil-line); border-radius: 40px; background: var(--veil); animation: arrive 260ms var(--ease-out) both; }
+
+.farewell .mark { display: block; }
+
+.farewell .say { max-width: 22ch; }
+
+.farewell .why { margin-inline: auto; }
+
+.farewell .acts { justify-content: center; margin-top: 1.4rem; }
+
+.farewell .progress { width: min(100%, 22rem); margin-top: 1.6rem; }
+
+@keyframes arrive { from { opacity: 0; transform: scale(0.96); } }
+
+@keyframes fade { from { opacity: 0; } }
 
 .more { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(15rem, 100%), 1fr)); align-content: start; gap: 1.75rem 2.5rem; margin: 1.75rem 0; }
 
@@ -476,7 +528,7 @@ fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
   .item:hover { background: var(--pick); }
   .folder:hover:not([aria-pressed="true"]), .trail button:hover { background: var(--veil); }
   .main-act:hover { background: #ffd566; }
-  .next:hover { background: var(--veil-line); }
+  .next:hover, .add-all:hover:not(:disabled) { background: var(--veil-line); }
   .link:hover:not(:disabled) { color: var(--ink); }
   .tabs button:hover { color: var(--ink); }
   .ticks label:hover { background: var(--veil); }
@@ -505,7 +557,9 @@ fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
   .app[data-tab="tidy"] #list { order: 1; }
   .app[data-tab="tidy"] #main { order: 2; }
   .app:not(.plain) #main { flex: 1 0 auto; }
-  .tabs button, .text { min-height: 2.75rem; }
+  .tabs button, .text, .add-all { min-height: 2.75rem; }
+  .rules .tools { gap: 0; margin-left: -0.4rem; }
+  .rules .tools .text { padding-inline: 0.4rem; }
   .ticks label { grid-template-columns: auto 1.25rem minmax(0, 1fr); }
   .ticks .note { grid-column: 3; text-align: left; }
   .more li { flex-wrap: wrap; justify-content: flex-start; gap: 0 1rem; }
@@ -522,7 +576,9 @@ fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .main-act, .next, .all, .tabs button, .switch, .switch i { transition: none; }
+  .main-act, .next, .all, .tabs button { transition: none; }
+  .switch, .switch i { transition-property: background-color, opacity; }
+  .farewell .badge { animation-name: fade; }
   .progress::after { width: 100%; animation: none; opacity: 0.6; }
 }
 

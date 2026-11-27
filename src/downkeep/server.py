@@ -321,6 +321,8 @@ class App:
         self.recovered: Result | None = None
         self.pages = 0
         self.started = self.seen = clock()
+        self.opened: float | None = None
+        self.gone: float | None = None
         self.working = 0
         self.acting = 0
         self.lock = threading.Lock()
@@ -332,7 +334,7 @@ class App:
             if self.key or not fresh or not isinstance(code, str) or not _equal(code, self.code):
                 return None
             self.key = secrets.token_urlsafe(32)
-            self.seen = self.clock()
+            self.seen = self.opened = self.clock()
             return self.key
 
     def allows(self, key: str | None) -> bool:
@@ -348,6 +350,12 @@ class App:
             self.pages -= 1
             self.seen = self.clock()
 
+    def window_gone(self) -> None:
+        """The window's own browser has exited. A launcher that only handed the link to a running browser exits
+        before the page opens, so that never counts."""
+        with self.lock:
+            self.gone = self.clock()
+
     def finished(self) -> bool:
         with self.lock:
             now = self.clock()
@@ -355,6 +363,8 @@ class App:
                 return False
             if self.key is None:
                 return now - self.started > CODE_SECONDS
+            if self.pages == 0 and self.gone is not None and self.opened is not None and self.gone >= self.opened:
+                return True
             return self.pages == 0 and now - self.seen > CLOSE_SECONDS
 
     def settle(self) -> None:
@@ -754,7 +764,7 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if not self._from_this_page():
             return
-        page = PAGES.get(self.path)
+        page = PAGES.get("/" if self.path == "/?window=app" else self.path)
         if page is None:
             return self._json(404, {"error": "not found"})
         name, kind = page

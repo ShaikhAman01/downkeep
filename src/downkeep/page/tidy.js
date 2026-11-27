@@ -3,7 +3,7 @@ import {
   act, bdi, button, ended, entry, facts, folderIcon, go, h, human, list, loading, main, mark, plural, restage, small, stage, state,
   baseName, clean, ticks, toast, total, trouble, visit, warnIcon,
 } from "./core.js";
-import { loadRules, showRules } from "./rules.js";
+import { loadRules, nameProblem, showRules } from "./rules.js";
 import { lists, listRuns, loadHistory, place, showHistory } from "./runs.js";
 
 const HERE = "Leave here";
@@ -11,6 +11,8 @@ const PROVEN = "Proven clutter";
 const off = new Set();
 let plan = null;
 let chosen = null;
+let focusTidy = false;
+let renames = 0;
 
 export const forgetPlan = () => { plan = null; };
 
@@ -44,22 +46,95 @@ export async function showTidy(focus = false) {
 
 const again = () => { plan = null; showTidy(true); };
 
+/** The server's same(): names some system would treat as one. Upper then lower case stands in for Python's casefold. */
+export const sameName = (name) => name.normalize("NFC").toUpperCase().toLowerCase().normalize("NFC");
+
+/** The suggested rules not yet covered by a rule for the same folder. An id already in use is left for the server to pick. */
+export function newRules(suggested, rules) {
+  const taken = new Set(rules.map((rule) => sameName(rule.folder)));
+  const ids = new Set(rules.map((rule) => rule.id));
+  const fresh = [];
+  for (const { rule } of suggested) {
+    if (taken.has(sameName(rule.folder))) continue;
+    taken.add(sameName(rule.folder));
+    const free = rule.id && !ids.has(rule.id);
+    if (free) ids.add(rule.id);
+    fresh.push(free ? rule : { ...rule, id: "" });
+  }
+  return fresh;
+}
+
 /** New folders worth having here. Nothing is made on disk until Tidy. */
 function suggestions(here) {
   if (!here.suggested?.length) return null;
   const block = h("section", { class: "suggest", "aria-labelledby": "suggest-title" });
+  const adds = [];
+  const names = new Map();
+  const shows = new Map();
+  const opens = new Map();
+  let known = null;
+  const nameOf = (item) => (names.get(item) ?? item.folder).trim();
+  const named = (item) => ({ ...item, folder: nameOf(item), rule: { ...item.rule, folder: nameOf(item) } });
+
+  /** A typed name is checked like any folder name, and may not be one that is already taken. */
+  function problemOf(item) {
+    const name = nameOf(item);
+    const wrong = nameProblem(name);
+    if (wrong) return wrong;
+    const key = sameName(name);
+    if (names.has(item) && known?.some((rule) => sameName(rule.folder) === key)) return `You already have a folder named ${clean(name)}.`;
+    const clash = (other) => other !== item && (names.has(item) || names.has(other)) && sameName(nameOf(other)) === key;
+    if (here.suggested.some(clash)) return "Another suggested folder has this name.";
+    return "";
+  }
+
+  /** Shows every problem, and puts the cursor in the first wrong name. False if there is one. */
+  function allRight(items) {
+    const wrong = items.filter((item) => shows.get(item)());
+    if (wrong.length) opens.get(wrong[0])();
+    return !wrong.length;
+  }
+
+  async function addAll() {
+    for (const control of adds) control.disabled = true;
+    let added;
+    try {
+      const { rules } = await loadRules();
+      known = rules;
+      if (!allRight(here.suggested)) {
+        for (const control of adds) control.disabled = false;
+        return;
+      }
+      const fresh = newRules(here.suggested.map(named), rules);
+      added = fresh.length;
+      if (added) await ask("/api/rules/save", { rules: [...fresh, ...rules] });
+    } catch (error) {
+      for (const control of adds) control.disabled = false;
+      if (!ended(error)) toast(clean(error.message));
+      return;
+    }
+    toast(added ? `Added ${plural(added, "folder")}. To undo, delete ${added === 1 ? "it" : "them"} in Change folders.` : "These folders are already there.");
+    go.changed();
+    focusTidy = true;
+    await showTidy(true);
+  }
 
   async function add(item, control) {
     control.disabled = true;
     try {
       const { rules } = await loadRules();
-      await ask("/api/rules/save", { rules: [item.rule, ...rules] });
+      known = rules;
+      if (!allRight([item])) {
+        control.disabled = false;
+        return;
+      }
+      await ask("/api/rules/save", { rules: [named(item).rule, ...rules] });
     } catch (error) {
       control.disabled = false;
       if (!ended(error)) toast(clean(error.message));
       return;
     }
-    toast(`Added ${clean(item.folder)}. To undo, delete it in Change folders.`);
+    toast(`Added ${clean(nameOf(item))}. To undo, delete it in Change folders.`);
     go.changed();
     showTidy(true);
   }
@@ -78,13 +153,56 @@ function suggestions(here) {
     go.focus();
   }
 
+  const count = here.suggested.length;
+  const all = count > 1 ? button("add-all", `Add all ${count} folders`, addAll) : null;
+  if (all) adds.push(all);
   block.append(
     h("div", { class: "tools" }, h("h3", { id: "suggest-title" }, "Suggested folders"),
-      button("text", "Not now", (event) => later(event.currentTarget), { "aria-label": "Not now, hide suggested folders" })),
-    h("ul", {}, ...here.suggested.map((item) => h("li", {},
-      folderIcon(),
-      h("div", {}, h("b", {}, bdi(item.folder)), h("p", { class: "soft" }, clean(item.why))),
-      button("text add", "Add", (event) => add(item, event.currentTarget), { "aria-label": `Add the folder ${clean(item.folder)}` })))),
+      h("span", { class: "suggest-acts" }, all,
+        button("text", "Not now", (event) => later(event.currentTarget), { "aria-label": "Not now, hide suggested folders" }))),
+    h("ul", {}, ...here.suggested.map((item) => {
+      const one = button("text add", "Add", (event) => add(item, event.currentTarget), { "aria-label": `Add the folder ${clean(item.folder)}` });
+      adds.push(one);
+      const id = `suggest-name-${renames += 1}`;
+      const error = h("p", { class: "problem", id: `${id}-problem` });
+      const title = h("b", {}, bdi(item.folder));
+      let input = null;
+      const show = () => {
+        const wrong = problemOf(item);
+        error.textContent = wrong;
+        input?.setAttribute("aria-invalid", String(Boolean(wrong)));
+        return wrong;
+      };
+      const open = () => {
+        if (input) return input.focus();
+        input = h("input", {
+          type: "text", id, class: "folder-name", dir: "ltr", maxlength: 60, autocomplete: "off", spellcheck: "false",
+          "aria-label": `Name for the suggested folder ${clean(item.folder)}`, "aria-describedby": `${id}-problem`,
+        });
+        input.value = nameOf(item);
+        names.set(item, input.value);
+        input.addEventListener("input", () => {
+          names.set(item, input.value);
+          // A change here can end a clash shown on another row
+          for (const each of shows.values()) each();
+        });
+        input.addEventListener("keydown", (event) => {
+          if (event.key === "Enter") {
+            event.preventDefault();
+            add(item, one);
+          }
+        });
+        title.replaceWith(input);
+        rename.remove();
+        input.focus();
+        input.select?.();
+        if (!known) loadRules().then((found) => { known = found.rules; show(); }, () => {});
+      };
+      const rename = button("text rename", "Rename", open, { "aria-label": `Rename ${clean(item.folder)} before adding it` });
+      shows.set(item, show);
+      opens.set(item, open);
+      return h("li", {}, folderIcon(), h("div", {}, h("span", { class: "named-row" }, title, rename), h("p", { class: "soft" }, clean(item.why)), error), one);
+    })),
   );
   return block;
 }
@@ -233,5 +351,9 @@ function draw(focus) {
     });
   } else {
     open(chosen, true);
+  }
+  if (focusTidy) {
+    focusTidy = false;
+    if (here.moves.length && !tidy.disabled) tidy.focus();
   }
 }

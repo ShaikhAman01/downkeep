@@ -282,6 +282,14 @@ export function stage({ say, what, why, art, buttons = [], note = "", focus = fa
   }
 }
 
+/** The screen that was just staged fades and rises in, so a new step never jumps into place. */
+export function enter() {
+  const still = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  // Starting part-way faded, the screen is never empty between one step and the next
+  const frames = still ? [{ opacity: 0.4 }, { opacity: 1 }] : [{ opacity: 0.4, transform: "translateY(8px)" }, { opacity: 1, transform: "none" }];
+  for (const part of [words, work, foot]) part.animate?.(frames, { duration: still ? 150 : 200, easing: "cubic-bezier(0.23, 1, 0.32, 1)", fill: "backwards" });
+}
+
 /** Changes the words of the screen that is showing, without redrawing it. */
 export function restage(say, what) {
   words.setAttribute("aria-live", "polite");
@@ -290,15 +298,40 @@ export function restage(say, what) {
   if (line && what) line.textContent = what;
 }
 
-export function message(title, lines, buttons = []) {
+/** Loaded now, while Downkeep still answers, and moved into place later: the closing screens may show after it has stopped. */
+const farewellLogo = h("img", { class: "mark", src: "/icon.svg", alt: "", width: 112, height: 112, decoding: "sync" });
+
+export const inAppWindow = () => {
+  try {
+    return sessionStorage.getItem("window") === "app";
+  } catch {
+    return false;
+  }
+};
+
+function closeButton(hint) {
+  return button("main-act", "Close window", () => {
+    window.close();
+    // A browser only lets a page close a window it opened itself
+    setTimeout(() => { hint.hidden = false; }, 300);
+  });
+}
+
+export function message(title, lines, buttons = [], close = false) {
   app.classList.add("plain");
   tabs.hidden = true;
   panel.removeAttribute("role");
   list.replaceChildren();
   sum.replaceChildren();
-  panel.replaceChildren(h("h1", { class: "say", tabindex: "-1" }, title), ...lines.map((line) => h("p", { class: "why" }, clean(line))));
-  if (buttons.length) panel.append(h("div", { class: "acts" }, ...buttons));
-  panel.append(h("div", { class: "art" }, lone("Downkeep", "")));
+  const hint = h("p", { class: "why", role: "status" }, "Your browser kept this window open. You can close it yourself.");
+  hint.hidden = true;
+  const acts = [...buttons, close ? closeButton(hint) : null].filter(Boolean);
+  panel.replaceChildren(h("div", { class: "farewell" },
+    h("span", { class: "badge" }, farewellLogo),
+    h("h1", { class: "say", tabindex: "-1" }, title),
+    ...lines.map((line) => h("p", { class: "why" }, clean(line))),
+    acts.length ? h("div", { class: "acts" }, ...acts) : null,
+    close ? hint : null));
   if (state.version) panel.append(h("p", { class: "foot" }, `Downkeep ${state.version}`));
   panel.querySelector("h1").focus({ preventScroll: true });
 }
@@ -321,13 +354,14 @@ export function closed() {
     ? "Files were being moved. Open it again: it checks where each one is, and nothing is deleted."
     : "Open it again to see your files. Nothing else will change.";
   hold(false);
-  message("Downkeep has closed", [last]);
+  message("Downkeep has closed", [last], [], true);
+  if (inAppWindow()) setTimeout(() => window.close(), 1500);
 }
 
 export function expired() {
   again.hidden = true;
   hold(false);
-  message("This link has expired", ["Open Downkeep again to get a fresh window. Each link works once, so nobody else can use it."]);
+  message("This link has expired", ["Open Downkeep again to get a fresh window. Each link works once, so nobody else can use it."], [], true);
 }
 
 /** Handles the two ends of a session. Anything else is for the screen to show. */

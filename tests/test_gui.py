@@ -65,7 +65,7 @@ class GuiTest(unittest.TestCase):
     def test_opening_recovers_first(self):
         self.actions.left = Result(None, ["a"])
         with (
-            mock.patch("downkeep.cli.open_window", side_effect=lambda url: self.actions.calls.append("window") or True),
+            mock.patch("downkeep.cli.open_window", side_effect=lambda url, avoid=None: self.actions.calls.append("window") or True),
             mock.patch("downkeep.cli.App.finished", return_value=True),
             mock.patch("builtins.print"),
         ):

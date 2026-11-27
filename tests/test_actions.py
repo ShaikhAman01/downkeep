@@ -1260,6 +1260,27 @@ class RealTest(ActionsTest):
             self.good("/api/tidy/later")
             self.assertEqual(self.plan()["suggested"], [])
 
+    def test_saving_every_suggested_folder_at_once(self):
+        for word, count in (("invoice", 4), ("lecture", 3), ("wedding", 3)):
+            for number in range(count):
+                self.add(f"{word}-{number}.pdf", b"%s %d" % (word.encode(), number))
+        made = self.plan()
+        self.assertEqual(len(made["suggested"]), 3, made["suggested"])
+        before = self.good("/api/rules")["rules"]
+        saved = self.good("/api/rules/save", {"rules": [item["rule"] for item in made["suggested"]] + before})["rules"]
+        folders = [item["folder"] for item in made["suggested"]]
+        self.assertEqual([rule["folder"] for rule in saved], folders + [rule["folder"] for rule in before])
+        self.assertEqual(saved[3:], before)
+        after = self.plan()
+        self.assertEqual(after["suggested"], [])
+        into = {move["name"]: move["folder"] for move in after["moves"]}
+        for word, folder in zip(("invoice", "lecture", "wedding"), sorted(folders)):
+            self.assertEqual(into[f"{word}-0.pdf"], folder)
+        self.assertIn("invoice-3.pdf", self.names())
+        twice = [made["suggested"][0]["rule"], made["suggested"][0]["rule"]] + before
+        self.refused("/api/rules/save", {"rules": twice})
+        self.assertEqual(self.good("/api/rules")["rules"], saved)
+
     def test_automatic(self):
         self.assertFalse(self.good("/api/auto")["on"])
         status = self.good("/api/auto/set", {"on": True, "confirmed": True})

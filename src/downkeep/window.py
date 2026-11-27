@@ -1,6 +1,8 @@
 import errno
 import os
+import re
 import shutil
+import stat
 import subprocess
 import sys
 import webbrowser
@@ -8,9 +10,10 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
+# Chromium first: the system's package manager updates it, so it never asks to be updated itself
 LINUX_BROWSERS = (
-    "google-chrome-stable", "google-chrome", "chromium", "chromium-browser",
-    "microsoft-edge-stable", "microsoft-edge", "brave", "brave-browser",
+    "chromium", "chromium-browser", "google-chrome-stable", "google-chrome",
+    "brave-browser", "brave", "microsoft-edge-stable", "microsoft-edge",
 )
 MAC_BROWSERS = ("Google Chrome", "Microsoft Edge", "Brave Browser", "Chromium")
 WINDOWS_BROWSERS = (
@@ -20,16 +23,87 @@ WINDOWS_BROWSERS = (
 )
 
 
-def open_window(url: str) -> bool:
-    """A window without tabs where possible, otherwise the normal browser."""
+# A profile of Downkeep's own, so the window brings no sign-in, sync, extensions, first-run or update screens
+APP_FLAGS = (
+    "--no-first-run", "--no-default-browser-check", "--disable-sync", "--disable-extensions",
+    "--disable-default-apps", "--disable-background-networking", "--disable-component-update",
+    "--disable-features=Translate,MediaRouter,OptimizationHints,SigninInterception", "--password-store=basic",
+    "--window-size=1080,780",
+)
+
+
+def open_window(url: str, avoid: str | None = None):
+    """A window without tabs where possible, otherwise the normal browser. Returns the window's own browser process
+    when there is one, so the caller can tell when it has gone, else whether a browser opened."""
     program = _app_browser()
     if program:
+        profile = browser_profile(program, avoid)
+        flags = [f"--user-data-dir={profile}", *APP_FLAGS] if profile else ["--window-size=1080,780"]
         try:
-            _start([program, f"--app={url}", "--window-size=1080,780"])
-            return True
+            return _start([program, f"--app={app_link(url)}", *flags])
         except OSError:
             pass
     return webbrowser.open(url)
+
+
+def app_link(url: str) -> str:
+    """Marks the link as opened in Downkeep's own window: only there may the page close itself."""
+    page, mark, code = url.partition("#")
+    return f"{page.split('?')[0]}?window=app{mark}{code}"
+
+
+def browser_profile(program: str, avoid: str | None = None) -> Path | None:
+    """A private folder for the window's browser, never a link and never inside the folder being tidied."""
+    from downkeep.store import data_folder
+
+    snap = _snap_name(program)
+    base = Path.home() / "snap" / snap / "common" / "downkeep" if snap else data_folder()
+    try:
+        base.mkdir(mode=0o700, parents=True, exist_ok=True)
+        place = base / "browser"
+        try:
+            os.mkdir(place, 0o700)
+        except FileExistsError:
+            pass
+        if not all(_plain_folder(path) for path in (base, place)):
+            return None
+        if hasattr(os, "geteuid"):
+            os.chmod(place, 0o700, follow_symlinks=False)
+        if avoid and _inside(os.path.realpath(place), os.path.realpath(avoid)):
+            return None
+        return place
+    except OSError:
+        return None
+
+
+def _plain_folder(path):
+    info = os.lstat(path)
+    mine = not hasattr(os, "geteuid") or info.st_uid == os.geteuid()
+    return stat.S_ISDIR(info.st_mode) and not _is_link(Path(path)) and mine
+
+
+def _inside(path, folder):
+    try:
+        return os.path.commonpath([path, folder]) == folder
+    except ValueError:
+        return False
+
+
+def _snap_name(program):
+    """Snap browsers can't reach hidden folders, so their profile goes where the snap may write."""
+    if sys.platform != "linux":
+        return None
+    if program.startswith("/snap/bin/"):
+        return os.path.basename(program)
+    try:
+        if os.path.realpath(program) == "/usr/bin/snap":
+            return os.path.basename(program)
+        with open(program, "rb") as file:
+            head = file.read(4096)
+    except OSError:
+        return None
+    found = re.search(rb"/snap/bin/([a-z0-9-]+)", head) if b"\0" not in head else None
+    return found.group(1).decode() if found else None
 
 
 def show_in_folder(path: str) -> None:
@@ -144,7 +218,7 @@ def _ask_file_manager(path):
 
 
 def _start(command):
-    subprocess.Popen(
+    return subprocess.Popen(
         command,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,

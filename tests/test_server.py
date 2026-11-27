@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import tempfile
 import threading
@@ -12,6 +13,7 @@ import time
 import unittest
 import zipfile
 from importlib.resources import files
+from pathlib import Path
 from unittest import mock
 
 from downkeep import server, window
@@ -303,6 +305,30 @@ class ServerTest(FolderTest):
         self.clock.now += 1_000_000
         self.assertFalse(self.app.finished())
 
+    def test_only_downkeeps_own_window_mark_is_allowed_on_the_page(self):
+        self.assertEqual(self.ask("GET", "/?window=app")[0], 200)
+        for path in ["/?window=other", "/?window=app&x=1", "/?x"]:
+            self.assertEqual(self.ask("GET", path)[0], 404)
+
+    def test_stops_at_once_when_its_own_window_exits(self):
+        page = self.stay(self.key())
+        self.wait_for_pages(1)
+        self.app.window_gone()
+        self.assertFalse(self.app.finished())
+        page.close()
+        self.wait_for_pages(0)
+        self.app.window_gone()
+        self.assertTrue(self.app.finished())
+
+    def test_a_launcher_that_exits_before_the_page_opens_is_not_the_window(self):
+        self.app.window_gone()
+        self.clock.now += 1
+        self.stay(self.key()).close()
+        self.wait_for_pages(0)
+        self.assertFalse(self.app.finished())
+        self.clock.now += server.CLOSE_SECONDS + 1
+        self.assertTrue(self.app.finished())
+
     def test_stops_soon_after_the_page_closes(self):
         self.stay(self.key()).close()
         self.wait_for_pages(0)
@@ -391,6 +417,12 @@ class ServerTest(FolderTest):
         page = files("downkeep").joinpath("page", "index.html").read_text(encoding="utf-8")
         self.assertIsNone(re.search(r"<script(?![^>]*\bsrc=)|\sstyle=|\son\w+=", page))
 
+    def test_the_header_shows_the_same_logo_as_the_tab(self):
+        page = files("downkeep").joinpath("page", "index.html").read_text(encoding="utf-8")
+        name = re.search(r'<p class="name">(.*?)</p>', page).group(1)
+        self.assertEqual(name, '<img class="logo" src="/icon.svg" alt="" width="26" height="26">Downkeep')
+        self.assertIn('<link rel="icon" href="/icon.svg" type="image/svg+xml">', page)
+
     def test_every_script_of_the_page_is_served_and_nothing_else(self):
         folder = files("downkeep").joinpath("page")
         found = {item.name for item in folder.iterdir() if item.name.endswith(".js")}
@@ -422,7 +454,12 @@ const any = new Proxy(function () {}, { get: (t, k) => (k === Symbol.toPrimitive
 function el(tag) {
   const e = { tagName: tag, attrs: {}, children: [], dataset: {}, handlers: {},
     setAttribute(n, v) { this.attrs[n] = String(v); }, getAttribute(n) { return this.attrs[n] ?? null; }, contains() { return false; },
-    addEventListener(n, f) { (this.handlers[n] ??= []).push(f); }, append(...c) { this.children.push(...c); }, replaceChildren(...c) { this.children = c; },
+    focus() { globalThis.focused = this; },
+    addEventListener(n, f) { (this.handlers[n] ??= []).push(f); },
+    append(...c) { for (const child of c) if (typeof child !== "string") child.parent = this; this.children.push(...c); },
+    replaceChildren(...c) { this.children = []; this.append(...c); },
+    replaceWith(other) { const at = this.parent.children.indexOf(this); other.parent = this.parent; this.parent.children[at] = other; },
+    remove() { if (this.parent) this.parent.children = this.parent.children.filter((child) => child !== this); },
     querySelectorAll() { return []; },
     get textContent() { return this.children.map((c) => (typeof c === "string" ? c : c.textContent)).join(""); },
     set textContent(t) { this.children = [String(t)]; } };
@@ -434,17 +471,26 @@ globalThis.document = new Proxy({ createElement: el, createElementNS: (ns, tag) 
 globalThis.matchMedia = () => ({ matches: false, addEventListener() {} });
 globalThis.SVGElement = class {};
 globalThis.addEventListener = () => {};
+globalThis.window = { close() { globalThis.closes = (globalThis.closes ?? 0) + 1; } };
+const stored = new Map();
+Object.defineProperty(globalThis, "sessionStorage", { configurable: true, value: {
+  getItem: (k) => stored.get(k) ?? null, setItem: (k, v) => stored.set(k, String(v)), removeItem: (k) => stored.delete(k) } });
 const asked = [];
 const answers = {};
 globalThis.fetch = async (path, { body }) => {
   asked.push([path, JSON.parse(body)]);
-  return { ok: true, status: 200, json: async () => answers[path] ?? {} };
+  const { status = 200, ...value } = answers[path] ?? {};
+  return { ok: status === 200, status, json: async () => value };
 };
-const press = async (node) => { for (const f of node.handlers.click ?? []) f({ detail: 0, currentTarget: node }); await new Promise((r) => setTimeout(r, 50)); };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const press = async (node, ms = 50) => { for (const f of node.handlers.click ?? []) f({ detail: 0, currentTarget: node }); await sleep(ms); };
+const type = async (input, value) => { input.value = value; for (const f of input.handlers.input ?? []) f({}); await sleep(20); };
 const page = process.argv[2];
 const core = await import(new URL(`file://${page}/core.js`));
 const clutter = await import(new URL(`file://${page}/clutter.js`));
 const auto = await import(new URL(`file://${page}/auto.js`));
+const tidy = await import(new URL(`file://${page}/tidy.js`));
+const rules = await import(new URL(`file://${page}/rules.js`));
 const panel = document.querySelector("#stage");
 const find = (node, test, out = []) => {
   if (typeof node !== "string") { if (test(node)) out.push(node); (node.children ?? []).forEach((child) => find(child, test, out)); }
@@ -547,8 +593,10 @@ class PageTest(unittest.TestCase):
       const master = find(panel, (node) => node.attrs?.role === "switch" && node.attrs["aria-label"] === "Automatic tidying")[0];
       const said = () => find(panel, (node) => node.tagName === "p" || node.tagName === "h2").map((node) => node.textContent).join(" | ");
       const first = said();
+      const folders = find(panel, (node) => /\\bfolders\\b/.test(node.attrs?.class ?? ""))[0];
+      const controls = () => find(folders, (node) => node.tagName === "select" || node.attrs?.role === "switch");
       asked.length = 0;
-      await press(master);
+      await press(master, 300);
     """
 
     def test_switching_on_asks_first_and_only_turn_on_tells_the_server(self):
@@ -556,9 +604,12 @@ class PageTest(unittest.TestCase):
           const before = asked.map((call) => call[0]);
           const asking = said();
           const buttons = find(panel, (node) => node.tagName === "button" && /main-act|next/.test(node.attrs.class));
-          await press(buttons.find((node) => node.textContent === "Turn on"));
-          return { first, before, asking, buttons: buttons.map((node) => node.textContent), after: asked.filter((call) => call[0] === "/api/auto/set") };
+          await press(buttons.find((node) => node.textContent === "Turn on"), 300);
+          return { first, before, asking, knob: master.attrs["aria-checked"], buttons: buttons.map((node) => node.textContent),
+                   after: asked.filter((call) => call[0] === "/api/auto/set"), calls: asked.map((call) => call[0]) };
         """)
+        self.assertEqual(seen["knob"], "true")
+        self.assertEqual(seen["calls"], ["/api/auto/set", "/api/auto", "/api/rules", "/api/history"])
         self.assertIn("Off until you turn it on.", seen["first"])
         self.assertEqual(seen["before"], [])
         for text in ["Turn on automatic tidying?", "Every hour, new files older than 1 day move to their folder, even when Downkeep is closed.",
@@ -569,10 +620,268 @@ class PageTest(unittest.TestCase):
         self.assertEqual(seen["buttons"], ["Turn on", "Cancel"])
         self.assertEqual(seen["after"], [["/api/auto/set", {"on": True, "confirmed": True}]])
 
-    def test_switching_off_is_one_click(self):
-        seen = self.run_page(self.AUTO % "true" + "return { first, after: asked.filter((call) => call[0] === '/api/auto/set') };")
+    def test_folders_wait_and_cannot_change_while_automatic_is_off(self):
+        body = """
+          core.state.report = { folder: "/x/Downloads", files: 4 };
+          Object.assign(answers, {
+            "/api/auto": { available: true, on: %s, folder: "/x/Downloads", waiting: 0, note: "" },
+            "/api/rules": { rules: [{ id: "documents", folder: "Documents", on: true, auto: true, days: 1 }] },
+            "/api/history": { batches: [] },
+            "/api/rules/save": { rules: [{ id: "documents", folder: "Documents", on: true, auto: false, days: 1 }] },
+          });
+          await auto.showAuto();
+          const folders = find(panel, (node) => /\\bfolders\\b/.test(node.attrs?.class ?? ""))[0];
+          const note = find(panel, (node) => node.attrs?.id === "autos-waiting")[0];
+          const controls = find(folders, (node) => node.tagName === "select" || node.attrs?.role === "switch");
+          return { list: folders.attrs, note: [note.tagName, note.textContent, Boolean(note.hidden)],
+                   controls: controls.map((node) => [node.tagName, Boolean(node.disabled), node.attrs["aria-disabled"]]) };
+        """
+        off = self.run_page(body % "false")
+        self.assertEqual(off["list"], {"class": "folders dim", "aria-describedby": "autos-waiting"})
+        self.assertEqual(off["note"], ["p", "These folders are used once you turn automatic tidying on", False])
+        self.assertEqual(off["controls"], [["select", True, "true"], ["button", True, "true"]])
+        on = self.run_page(body % "true")
+        self.assertEqual(on["list"], {"class": "folders"})
+        self.assertEqual(on["note"], ["p", "New files that match go to these folders.", False])
+        self.assertEqual(on["controls"], [["select", False, "false"], ["button", False, "false"]])
+
+    def test_switching_off_is_one_click_and_changes_the_screen_in_place(self):
+        seen = self.run_page(self.AUTO % "true" + """
+          const same = find(panel, (node) => /\\bfolders\\b/.test(node.attrs?.class ?? ""))[0] === folders;
+          return { first, calls: asked, same, list: folders.attrs, knob: master.attrs["aria-checked"],
+                   controls: controls().map((node) => Boolean(node.disabled)), now: said() };
+        """)
         self.assertIn("On. It only moves files that arrived after you turned it on", seen["first"])
-        self.assertEqual(seen["after"], [["/api/auto/set", {"on": False}]])
+        self.assertEqual(seen["calls"], [["/api/auto/set", {"on": False}]])
+        self.assertTrue(seen["same"])
+        self.assertEqual((seen["list"]["class"], seen["knob"]), ("folders dim", "false"))
+        self.assertEqual(set(seen["controls"]), {True})
+        self.assertIn("Off. Nothing moves by itself.", seen["now"])
+
+    def test_cancel_goes_back_without_asking_the_server(self):
+        seen = self.run_page(self.AUTO % "false" + """
+          const cancel = find(panel, (node) => node.tagName === "button" && node.textContent === "Cancel")[0];
+          await press(cancel);
+          const again = find(panel, (node) => node.attrs?.role === "switch" && node.attrs["aria-label"] === "Automatic tidying")[0];
+          return { calls: asked, now: said(), knob: again.attrs["aria-checked"] };
+        """)
+        self.assertEqual(seen["calls"], [])
+        self.assertIn("Off until you turn it on.", seen["now"])
+        self.assertEqual(seen["knob"], "false")
+
+    SUGGEST = """
+      const rule = (id, folder, word) => ({ id, folder, words: [word], kinds: [], extensions: [], sites: [], on: true, auto: true, days: 1 });
+      const existing = [rule("own-1", "Bills", "bill"), rule("documents", "Documents", "doc"), rule("images", "Images", "img")];
+      const suggested = %s;
+      core.state.system = { tidy: true, trash: true };
+      core.state.report = { folder: "/x/Downloads", files: 3 };
+      core.go.changed = tidy.forgetPlan;
+      core.go.focus = () => {};
+      Object.assign(answers, {
+        "/api/tidy/plan": { plan: "p1", moves: [{ name: "a.pdf", folder: "Documents", why: "A document", bytes: 5 }],
+          stays: [], folders: [{ name: "Documents", exists: true }], suggested },
+        "/api/rules": { rules: existing },
+        "/api/rules/save": %s,
+      });
+      tidy.forgetPlan();
+      await tidy.showTidy();
+      const adds = () => find(panel, (node) => node.tagName === "button" && /\\badd/.test(node.attrs.class ?? ""));
+      const all = adds().find((node) => node.textContent.startsWith("Add all"));
+      const labels = adds().map((node) => node.textContent);
+      asked.length = 0;
+      globalThis.focused = null;
+    """
+
+    @staticmethod
+    def suggestion(folder, word, id_):
+        return {"folder": folder, "why": f"3 files have {word} in the name", "files": 3,
+                "rule": {"id": id_, "folder": folder, "words": [word], "kinds": [], "extensions": [], "sites": [], "on": True, "auto": True, "days": 1}}
+
+    def test_add_all_saves_every_new_suggestion_in_one_call(self):
+        suggested = [self.suggestion("Lectures", "lecture", "own-2"), self.suggestion("BILLS", "invoice", "own-3"),
+                     self.suggestion("Wedding", "wedding", "own-1"), self.suggestion("lectures", "notes", "own-4")]
+        seen = self.run_page(self.SUGGEST % (json.dumps(suggested), "{}") + """
+          await press(all);
+          await new Promise((r) => setTimeout(r, 100));
+          return { labels, asked, toast: document.querySelector("#status").textContent,
+                   focused: globalThis.focused?.textContent ?? null, focusedClass: globalThis.focused?.attrs?.class ?? null };
+        """)
+        self.assertEqual(seen["labels"], ["Add all 4 folders", "Add", "Add", "Add", "Add"])
+        saves = [call for call in seen["asked"] if call[0] == "/api/rules/save"]
+        self.assertEqual(len(saves), 1)
+        rules = saves[0][1]["rules"]
+        self.assertEqual([(rule["id"], rule["folder"]) for rule in rules], [
+            ("own-2", "Lectures"), ("", "Wedding"), ("own-1", "Bills"), ("documents", "Documents"), ("images", "Images")])
+        self.assertEqual(rules[2:], [
+            {"id": "own-1", "folder": "Bills", "words": ["bill"], "kinds": [], "extensions": [], "sites": [], "on": True, "auto": True, "days": 1},
+            {"id": "documents", "folder": "Documents", "words": ["doc"], "kinds": [], "extensions": [], "sites": [], "on": True, "auto": True, "days": 1},
+            {"id": "images", "folder": "Images", "words": ["img"], "kinds": [], "extensions": [], "sites": [], "on": True, "auto": True, "days": 1},
+        ])
+        self.assertEqual(seen["toast"], "Added 2 folders. To undo, delete them in Change folders.")
+        self.assertEqual([call[0] for call in seen["asked"]], ["/api/rules", "/api/rules/save", "/api/tidy/plan"])
+        self.assertEqual((seen["focused"], seen["focusedClass"]), ("Tidy 1 file", "main-act"))
+        self.assertFalse(any(call[0] == "/api/tidy/apply" for call in seen["asked"]))
+
+    def test_names_match_the_way_the_server_compares_folders(self):
+        same = self.run_page("""return ["Stra\\u00dfe", "STRASSE", "Cafe\\u0301", "caf\\u00e9", "\\ufb01les", "FILES"].map(tidy.sameName);""")
+        self.assertEqual(same[0], same[1])
+        self.assertEqual(same[2], same[3])
+        self.assertEqual(same[4], same[5])
+
+    def test_add_all_is_hidden_for_one_suggestion(self):
+        seen = self.run_page(self.SUGGEST % (json.dumps([self.suggestion("Lectures", "lecture", "own-2")]), "{}") + "return { labels, all: Boolean(all) };")
+        self.assertEqual(seen, {"labels": ["Add"], "all": False})
+
+    def test_add_all_error_gives_the_buttons_back(self):
+        suggested = [self.suggestion("Lectures", "lecture", "own-2"), self.suggestion("Wedding", "wedding", "own-3")]
+        seen = self.run_page(self.SUGGEST % (json.dumps(suggested), '{ status: 400, error: "There can be at most 100 rules" }') + """
+          const during = [];
+          const save = globalThis.fetch;
+          globalThis.fetch = async (path, init) => { if (path === "/api/rules/save") during.push(adds().map((node) => Boolean(node.disabled))); return save(path, init); };
+          await press(all);
+          await new Promise((r) => setTimeout(r, 100));
+          return { during, after: adds().map((node) => Boolean(node.disabled)), toast: document.querySelector("#status").textContent,
+                   asked: asked.map((call) => call[0]), focused: globalThis.focused?.textContent ?? null };
+        """)
+        self.assertEqual(seen["during"], [[True, True, True]])
+        self.assertEqual(seen["after"], [False, False, False])
+        self.assertEqual(seen["toast"], "There can be at most 100 rules")
+        self.assertEqual(seen["asked"], ["/api/rules", "/api/rules/save"])
+        self.assertIsNone(seen["focused"])
+
+    RENAME = """
+      const input = (n = 0) => find(panel, (node) => node.tagName === "input")[n];
+      const renames = () => find(panel, (node) => node.tagName === "button" && node.textContent === "Rename");
+      const problems = () => find(panel, (node) => /\\bproblem\\b/.test(node.attrs?.class ?? "")).map((node) => node.textContent).filter(Boolean);
+      const saves = () => asked.filter((call) => call[0] === "/api/rules/save").map((call) => call[1].rules.map((rule) => rule.folder));
+    """
+
+    def test_a_suggested_name_can_be_changed_before_adding(self):
+        suggested = [self.suggestion("Lectures", "lecture", "own-2"), self.suggestion("Wedding", "wedding", "own-3")]
+        seen = self.run_page(self.SUGGEST % (json.dumps(suggested), "{}") + self.RENAME + """
+          await press(renames()[0]);
+          const opened = [input().value, input().attrs["aria-label"], renames().length];
+          const out = {};
+          for (const [label, name] of [["slash", "Class/notes"], ["empty", "   "], ["dot", ".hidden"], ["taken", "bills"], ["twin", "wedding"], ["long", "x".repeat(61)]]) {
+            await type(input(), name);
+            out[label] = [problems()[0] ?? "", input().attrs["aria-invalid"]];
+          }
+          await type(input(), "wedding");
+          await press(all, 150);
+          out.blocked = [saves().length, Boolean(all.disabled), globalThis.focused === input()];
+          await type(input(), "  Class notes ");
+          out.fine = [problems().length, input().attrs["aria-invalid"]];
+          await press(all, 150);
+          out.saved = saves();
+          return { opened, ...out };
+        """)
+        self.assertEqual(seen["opened"], ["Lectures", "Name for the suggested folder Lectures", 1])
+        self.assertEqual(seen["slash"], ['A folder name can\'t contain < > : " / \\ | ? * or invisible characters.', "true"])
+        self.assertEqual(seen["empty"][0], "A folder needs a name.")
+        self.assertEqual(seen["dot"][0], "A folder name can't start with a dot, a space or ~.")
+        self.assertEqual(seen["taken"][0], "You already have a folder named bills.")
+        self.assertEqual(seen["twin"][0], "Another suggested folder has this name.")
+        self.assertEqual(seen["long"][0], "A folder name can have at most 60 characters.")
+        self.assertEqual(seen["blocked"], [0, False, True])
+        self.assertEqual(seen["fine"], [0, "false"])
+        self.assertEqual(seen["saved"], [["Class notes", "Wedding", "Bills", "Documents", "Images"]])
+
+    def test_one_add_uses_the_typed_name(self):
+        suggested = [self.suggestion("Lectures", "lecture", "own-2"), self.suggestion("Wedding", "wedding", "own-3")]
+        seen = self.run_page(self.SUGGEST % (json.dumps(suggested), "{}") + self.RENAME + """
+          await press(renames()[1]);
+          await type(input(), "Our wedding");
+          const add = find(panel, (node) => node.tagName === "button" && node.textContent === "Add")[1];
+          await press(add, 150);
+          return { saved: saves(), toast: document.querySelector("#status").textContent };
+        """)
+        self.assertEqual(seen["saved"], [["Our wedding", "Bills", "Documents", "Images"]])
+        self.assertEqual(seen["toast"], "Added Our wedding. To undo, delete it in Change folders.")
+
+    def test_folder_names_are_checked_like_the_server_does(self):
+        from downkeep.sorting import _check_folder
+
+        names = ["", " ", "Bills", "Café", "Straße", "x" * 60, "x" * 61, "é" * 60, "Docu/ments", 'a"b', "a?b",
+                 "a​b", "a b", "a\tb", ".hidden", "~x", " lead", "trail.", "trail ", "CON", "con.txt", "COM¹", "Lpt9 .x",
+                 "Console", "Class notes", "ملفات"]
+        found = self.run_page("return %s.map((name) => rules.nameProblem(name));" % json.dumps(names))
+        for name, problem in zip(names, found):
+            with self.subTest(name=name):
+                try:
+                    _check_folder(name)
+                    server = ""
+                except Exception as error:
+                    server = str(error)
+                self.assertEqual(bool(problem), bool(server), (problem, server))
+
+    def test_change_folders_says_what_each_link_does(self):
+        seen = self.run_page("""
+          const rule = (id, folder) => ({ id, folder, words: ["x"], kinds: [], extensions: [], sites: [], on: true, auto: false, days: 7 });
+          answers["/api/rules"] = { rules: [rule("own-1", "Bills"), rule("own-2", "Class notes"), rule("documents", "Documents")],
+            kinds: [], defaults: [rule("documents", "Documents")] };
+          await rules.showRules();
+          const tools = find(panel, (node) => /\\btools\\b/.test(node.attrs?.class ?? ""));
+          const lead = find(panel, (node) => node.attrs?.class === "lead")[0];
+          const box = find(panel, (node) => node.tagName === "input")[0];
+          return { lead: lead.textContent, box: box.attrs["aria-label"],
+                   links: tools.filter((node) => node.children.length).map((node) => node.children.map((b) => [b.textContent, b.attrs["aria-label"], "disabled" in b.attrs])) };
+        """)
+        self.assertEqual(seen["lead"], "If a file fits more than one folder, it goes to the highest one.")
+        self.assertEqual(seen["box"], "Folder name, type here to rename")
+        self.assertEqual(seen["links"], [
+            [["Choose files", "Choose which files go to Bills. To rename it, type in its name box.", False],
+             ["Move up", "Move Bills up", True], ["Move down", "Move Bills down", False], ["Delete", "Delete Bills", False]],
+            [["Choose files", "Choose which files go to Class notes. To rename it, type in its name box.", False],
+             ["Move up", "Move Class notes up", False], ["Move down", "Move Class notes down", True], ["Delete", "Delete Class notes", False]],
+        ])
+
+    def test_the_closed_screen_shows_the_logo_and_can_close_its_own_window(self):
+        seen = self.run_page("""
+          const screen = (inApp) => {
+            stored.clear();
+            if (inApp) stored.set("window", "app");
+            return null;
+          };
+          const look = () => {
+            const mark = find(panel, (node) => node.attrs?.class === "mark")[0];
+            const buttons = find(panel, (node) => node.tagName === "button").map((node) => node.textContent);
+            return { mark: mark ? [mark.tagName, mark.attrs.src, mark.attrs.alt, mark.attrs.width] : null,
+                     title: find(panel, (node) => node.tagName === "h1")[0].textContent, buttons };
+          };
+          screen(true);
+          core.closed();
+          const closed = look();
+          globalThis.closes = 0;
+          await sleep(1700);
+          const automatically = globalThis.closes;
+          core.expired();
+          const expired = look();
+          await sleep(1700);
+          const afterExpired = globalThis.closes;
+          await press(find(panel, (node) => node.tagName === "button" && node.textContent === "Close window")[0], 400);
+          const hint = find(panel, (node) => node.attrs?.role === "status")[0];
+          return { closed, automatically, expired, afterExpired, pressed: globalThis.closes, hint: [hint.textContent, Boolean(hint.hidden)] };
+        """)
+        self.assertEqual(seen["closed"]["title"], "Downkeep has closed")
+        self.assertEqual(seen["closed"]["buttons"], ["Close window"])
+        self.assertEqual(seen["automatically"], 1)
+        self.assertEqual(seen["expired"]["title"], "This link has expired")
+        self.assertEqual(seen["expired"]["buttons"], ["Close window"])
+        self.assertEqual(seen["afterExpired"], 1)
+        self.assertEqual(seen["pressed"], 2)
+        self.assertEqual(seen["hint"], ["Your browser kept this window open. You can close it yourself.", False])
+        self.assertEqual(seen["closed"]["mark"], ["img", "/icon.svg", "", "112"])
+        self.assertEqual(seen["expired"]["mark"], ["img", "/icon.svg", "", "112"])
+
+    def test_the_window_stays_when_it_is_not_downkeeps_own(self):
+        seen = self.run_page("""
+          stored.clear();
+          globalThis.closes = 0;
+          core.closed();
+          await sleep(1700);
+          return globalThis.closes;
+        """)
+        self.assertEqual(seen, 0)
 
 
 class WindowTest(unittest.TestCase):
@@ -600,7 +909,7 @@ class WindowTest(unittest.TestCase):
     def test_window_falls_back_to_the_browser(self):
         with mock.patch("downkeep.window._app_browser", return_value=None), mock.patch("webbrowser.open") as browser:
             window.open_window("http://127.0.0.1:1/#x")
-        browser.assert_called_once()
+        browser.assert_called_once_with("http://127.0.0.1:1/#x")
         with (
             mock.patch("downkeep.window._app_browser", return_value="/bin/chrome"),
             mock.patch("downkeep.window._start", side_effect=OSError),
@@ -614,10 +923,71 @@ class WindowTest(unittest.TestCase):
             with mock.patch("downkeep.window._app_browser", return_value=None), mock.patch("webbrowser.open", return_value=opened):
                 self.assertIs(window.open_window("http://127.0.0.1:1/#x"), opened)
 
-    def test_app_window(self):
-        with mock.patch("downkeep.window._app_browser", return_value="/bin/chrome"), mock.patch("downkeep.window._start") as start:
-            window.open_window("http://127.0.0.1:1/#x")
-        self.assertEqual(start.call_args.args[0][:2], ["/bin/chrome", "--app=http://127.0.0.1:1/#x"])
+    def setUp(self):
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        self.base = Path(holder.name)
+        patch = mock.patch.dict(os.environ, {"DOWNKEEP_DATA": str(self.base / "data")})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def launch(self, program="/usr/bin/chromium", avoid=None):
+        process = mock.Mock()
+        with mock.patch("downkeep.window._app_browser", return_value=program), mock.patch("downkeep.window._start", return_value=process) as start:
+            self.assertIs(window.open_window("http://127.0.0.1:1/#x", avoid), process)
+        return start.call_args.args[0]
+
+    def test_app_window_has_a_profile_of_its_own(self):
+        command = self.launch()
+        profile = self.base / "data" / "browser"
+        self.assertEqual(command[:3], ["/usr/bin/chromium", "--app=http://127.0.0.1:1/?window=app#x", f"--user-data-dir={profile}"])
+        for flag in ["--no-first-run", "--no-default-browser-check", "--disable-sync", "--disable-extensions", "--disable-background-networking"]:
+            self.assertIn(flag, command)
+        self.assertTrue(profile.is_dir())
+        if os.name == "posix":
+            self.assertEqual(stat.S_IMODE(profile.stat().st_mode), 0o700)
+
+    def test_the_profile_is_never_a_link_or_inside_the_tidied_folder(self):
+        elsewhere = self.base / "elsewhere"
+        elsewhere.mkdir()
+        (self.base / "data").mkdir()
+        (self.base / "data" / "browser").symlink_to(elsewhere)
+        command = self.launch()
+        self.assertFalse(any(part.startswith("--user-data-dir") for part in command))
+        self.assertEqual(command[1], "--app=http://127.0.0.1:1/?window=app#x")
+        (self.base / "data" / "browser").unlink()
+        command = self.launch(avoid=str(self.base))
+        self.assertFalse(any(part.startswith("--user-data-dir") for part in command))
+        self.assertTrue(any(part.startswith("--user-data-dir") for part in self.launch(avoid=str(elsewhere))))
+
+    def test_a_snap_browser_keeps_its_profile_where_the_snap_may_write(self):
+        with mock.patch("downkeep.window.sys.platform", "linux"), mock.patch("downkeep.window.Path.home", return_value=self.base / "home"):
+            command = self.launch("/snap/bin/chromium")
+            self.assertIn(f"--user-data-dir={self.base / 'home' / 'snap' / 'chromium' / 'common' / 'downkeep' / 'browser'}", command)
+            wrapper = self.base / "chromium-browser"
+            wrapper.write_text("#!/bin/sh\nexec /snap/bin/chromium \"$@\"\n")
+            self.assertEqual(window._snap_name(str(wrapper)), "chromium")
+            self.assertIsNone(window._snap_name("/usr/bin/sh"))
+
+    def test_windows_and_mac_browsers_get_the_same_window(self):
+        for program in [r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe", "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"]:
+            with self.subTest(program=program):
+                command = self.launch(program)
+                self.assertEqual(command[0], program)
+                self.assertEqual(command[2], f"--user-data-dir={self.base / 'data' / 'browser'}")
+                self.assertEqual(command[3:], list(window.APP_FLAGS))
+
+    def test_linux_prefers_chromium(self):
+        found = {"google-chrome-stable": "/usr/bin/google-chrome-stable", "chromium": "/usr/bin/chromium"}
+        with mock.patch("downkeep.window.sys.platform", "linux"), mock.patch("downkeep.window.shutil.which", found.get):
+            self.assertEqual(window._app_browser(), "/usr/bin/chromium")
+        with mock.patch("downkeep.window.sys.platform", "linux"), mock.patch("downkeep.window.shutil.which", {"google-chrome": "/opt/chrome"}.get):
+            self.assertEqual(window._app_browser(), "/opt/chrome")
+
+    def test_app_link(self):
+        self.assertEqual(window.app_link("http://127.0.0.1:1/#abc"), "http://127.0.0.1:1/?window=app#abc")
+        self.assertEqual(window.app_link("http://127.0.0.1:1/?x=1#abc"), "http://127.0.0.1:1/?window=app#abc")
+        self.assertEqual(window.app_link("http://127.0.0.1:1/"), "http://127.0.0.1:1/?window=app")
 
 
 if __name__ == "__main__":

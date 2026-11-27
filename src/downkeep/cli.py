@@ -90,6 +90,7 @@ def open_app(folder: str | None, no_browser: bool = False, tell: Callable[[str],
         print(f"downkeep: {clean(str(error))}", file=sys.stderr)
         return 2
     app = App(str(root), show_in_folder)
+    browser = None
     app.recover()
     server = make_server(app)
     url = f"http://{HOST}:{server.server_address[1]}/#{quote(app.code)}"
@@ -104,7 +105,8 @@ def open_app(folder: str | None, no_browser: bool = False, tell: Callable[[str],
                 return 2
         elif no_browser:
             print(url, flush=True)
-        elif open_window(url):
+        elif opened := open_window(url, str(root)):
+            browser = opened if hasattr(opened, "poll") else None
             print("Downkeep is open in a window. Close it to stop, or press Ctrl+C here.", flush=True)
         elif tell:
             tell("Downkeep couldn't open a web browser. Install one, then open Downkeep again.")
@@ -113,6 +115,9 @@ def open_app(folder: str | None, no_browser: bool = False, tell: Callable[[str],
             print(f"Couldn't open a browser. Open this link within 2 minutes:\n{url}", flush=True)
         done = threading.Event()
         while not app.finished():
+            if browser is not None and browser.poll() is not None:
+                app.window_gone()
+                browser = None
             done.wait(0.5)
     except KeyboardInterrupt:
         pass

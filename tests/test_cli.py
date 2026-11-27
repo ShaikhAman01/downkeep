@@ -54,6 +54,21 @@ class CliTest(FolderTest):
                 self.assertRegex(window.call_args.args[0], r"^http://127\.0\.0\.1:\d+/#.{40,}$")
                 self.assertNotIn("http", out)
 
+    def test_stops_when_the_window_process_exits(self):
+        process = mock.Mock()
+        process.poll.side_effect = [None, None, 0]
+        gone = []
+        with (
+            mock.patch("downkeep.cli.downloads_folder", return_value=self.folder),
+            mock.patch("downkeep.cli.open_window", return_value=process) as window,
+            mock.patch("downkeep.cli.App.window_gone", lambda app: gone.append(True)),
+            mock.patch("downkeep.cli.App.finished", lambda app: bool(gone)),
+        ):
+            code, _, err = run()
+        self.assertEqual((code, err, gone), (0, "", [True]))
+        self.assertEqual(process.poll.call_count, 3)
+        self.assertEqual(window.call_args.args[1], str(self.folder))
+
     def test_open_without_a_browser_prints_the_link(self):
         with mock.patch("downkeep.cli.App.finished", return_value=True):
             code, out, _ = run("open", str(self.folder), "--no-browser")

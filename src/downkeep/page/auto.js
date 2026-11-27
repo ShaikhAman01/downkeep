@@ -1,15 +1,19 @@
 import { ask } from "./ask.js";
-import { baseName, bdi, button, clean, ended, go, h, list, loading, plural, sentence, stage, state, switchButton, trouble, visit } from "./core.js";
+import { baseName, bdi, button, clean, ended, enter, go, h, list, loading, panel, plural, sentence, stage, state, switchButton, trouble, visit } from "./core.js";
 import { loadRules } from "./rules.js";
 import { listRuns, loadHistory, place, showHistory, undo } from "./runs.js";
 
 const DAYS = [0, 1, 2, 3, 7, 14, 30];
 const after = (days) => (days === 0 ? "right away" : `after ${plural(days, "day")}`);
 const NEVER = "Trash is never automatic. Anything unclear stays in Downloads.";
+const SLIDE = 170;
+const reduced = () => matchMedia("(prefers-reduced-motion: reduce)").matches;
+const pause = (ms) => new Promise((done) => { setTimeout(done, reduced() ? 0 : ms); });
 
-export async function showAuto(focus = false) {
-  const at = loading("Looking at what happens by itself", "This only reads your choices.");
-  list.replaceChildren();
+/** `quiet` keeps the screen that is showing until the new one is ready, so nothing flashes. */
+export async function showAuto(focus = false, { quiet = false, arriving = false } = {}) {
+  const at = quiet ? visit() : loading("Looking at what happens by itself", "This only reads your choices.");
+  if (!quiet) list.replaceChildren();
   let status;
   let rules = [];
   try {
@@ -23,10 +27,10 @@ export async function showAuto(focus = false) {
     return;
   }
   if (state.visit !== at) return;
-  draw(status, rules, focus);
+  draw(status, rules, focus, arriving);
 }
 
-function draw(status, rules, focus) {
+function draw(status, rules, focus, arriving = false) {
   visit();
   if (!status.available && !status.on) {
     stage({
@@ -48,10 +52,33 @@ function draw(status, rules, focus) {
   const problem = h("p", { class: "problem", role: "alert" });
   const elsewhere = status.on && status.folder && status.folder !== state.report.folder;
 
+  const back = () => draw(status, shown, true);
+
   async function master(on, control) {
-    if (on) return preview(shown);
+    control.setAttribute("aria-checked", String(on));
+    if (on) {
+      // The knob finishes its slide before the next step comes in
+      await pause(SLIDE);
+      return preview(shown, back);
+    }
     control.disabled = true;
-    await set(false, problem, control);
+    apply(false);
+    problem.textContent = "";
+    try {
+      status = await ask("/api/auto/set", { on: false });
+    } catch (error) {
+      control.setAttribute("aria-checked", "true");
+      control.disabled = false;
+      apply(true);
+      if (!ended(error)) problem.textContent = sentence(clean(error.message));
+      return;
+    }
+    control.disabled = false;
+    if (elsewhere) return showAuto(true, { quiet: true });
+    idle();
+    const why = panel.querySelector(".why");
+    if (why) why.textContent = intro(status, false);
+    panel.querySelector(".what")?.remove();
   }
 
   async function change(rule, changes, control, undoChange) {
@@ -87,11 +114,31 @@ function draw(status, rules, focus) {
       control.setAttribute("aria-checked", String(on));
       change(rule, { auto: on }, control, () => control.setAttribute("aria-checked", String(!on)));
     });
+    controls.push(choice, control);
     return h("li", {}, h("div", {}, h("b", {}, bdi(rule.folder)), h("p", { class: "soft" }, "to ", bdi(place(baseName(state.report.folder), rule.folder)), ", ", choice)), control);
   }
 
   idle();
   const usable = shown.filter((rule) => rule.on);
+  const controls = [];
+  const waiting = h("p", { class: "soft waiting", id: "autos-waiting" }, "These folders are used once you turn automatic tidying on");
+  const folders = h("ul", { class: "folders" }, ...usable.map(row));
+
+  /** While it is off the folders wait: faded, and not changeable until it is on. */
+  function apply(on) {
+    folders.setAttribute("class", on ? "folders" : "folders dim");
+    if (on) folders.removeAttribute("aria-describedby");
+    else folders.setAttribute("aria-describedby", "autos-waiting");
+    // The line keeps its place either way, so the list never jumps
+    waiting.textContent = on ? "New files that match go to these folders." : "These folders are used once you turn automatic tidying on";
+    waiting.hidden = !usable.length;
+    for (const control of controls) {
+      control.disabled = !on;
+      control.setAttribute("aria-disabled", String(!on));
+    }
+  }
+  apply(status.on && !arriving);
+  if (arriving) waiting.textContent = "New files that match go to these folders.";
   const last = runs.find((run) => run.can_undo && !run.undone);
   stage({
     say: "Tidy new files for me",
@@ -101,17 +148,26 @@ function draw(status, rules, focus) {
       h("ul", {},
         h("li", { class: "master" },
           h("div", {}, h("b", {}, "Automatic tidying"), note),
-          switchButton(status.on, "Automatic tidying", master)),
-        ...usable.map(row)),
+          switchButton(status.on, "Automatic tidying", master))),
+      waiting,
+      folders,
       problem),
     buttons: [
-      elsewhere ? button("main-act", "Use this folder instead", () => preview(shown)) : null,
+      elsewhere ? button("main-act", "Use this folder instead", () => preview(shown, back)) : null,
       last ? button("next", "Undo last run", () => undo(last.batch, "auto")) : null,
       button("next", "History", () => showHistory("auto")),
     ].filter(Boolean),
     note: NEVER,
     focus,
   });
+  if (arriving) {
+    enter();
+    setTimeout(() => {
+      apply(status.on);
+      folders.classList.add("waking");
+      setTimeout(() => folders.classList.remove("waking"), 400);
+    }, reduced() ? 0 : 120);
+  }
 }
 
 export function intro(status, elsewhere) {
@@ -137,7 +193,7 @@ function state_(status, rules, elsewhere) {
 }
 
 /** Nothing here now ever moves by itself: turning it on counts every file already in the folder as staying. */
-export function preview(rules) {
+export function preview(rules, back = () => go.tab("auto")) {
   visit();
   const used = rules.filter((rule) => rule.on && rule.auto);
   const problem = h("p", { class: "problem", role: "alert" });
@@ -154,11 +210,12 @@ export function preview(rules) {
       problem),
     buttons: [
       used.length ? button("main-act", "Turn on", (event) => { event.currentTarget.disabled = true; set(true, problem, event.currentTarget); }) : null,
-      button("next", "Cancel", () => go.tab("auto")),
+      button("next", "Cancel", back),
     ].filter(Boolean),
     note: NEVER,
     focus: true,
   });
+  enter();
 }
 
 async function set(on, problem, control) {
@@ -171,5 +228,5 @@ async function set(on, problem, control) {
     problem.textContent = sentence(clean(error.message));
     return;
   }
-  await showAuto(true);
+  await showAuto(true, { quiet: true, arriving: on });
 }

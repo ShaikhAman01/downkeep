@@ -127,7 +127,7 @@ async function check() {
   toast("");
   forgetPlan();
   message("Checking your files", ["Reading names, comparing files of the same size, and looking inside zips.", "Big folders can take a minute. Nothing is being changed."]);
-  panel.querySelector(".art").before(bar());
+  panel.querySelector(".farewell").append(bar());
   panel.setAttribute("aria-busy", "true");
   let report;
   try {
@@ -241,6 +241,11 @@ async function stay() {
 async function start() {
   if (sample) return check();
   const code = decodeURIComponent(location.hash.slice(1));
+  try {
+    if (new URLSearchParams(location.search).get("window") === "app") sessionStorage.setItem("window", "app");
+  } catch {
+    // Without storage the window just stays open when Downkeep stops
+  }
   history.replaceState(null, "", "/");
   try {
     if (code) {

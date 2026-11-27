@@ -50,7 +50,7 @@ function edit({ rules, kinds, defaults }) {
   function nameField(rule) {
     const id = `field-${fields += 1}`;
     const error = h("p", { class: "problem", id: `${id}-problem` });
-    const input = h("input", { type: "text", id, class: "folder-name", dir: "ltr", maxlength: 60, "aria-describedby": `${id}-problem`, "aria-label": "Folder name", autocomplete: "off", spellcheck: "false" });
+    const input = h("input", { type: "text", id, class: "folder-name", dir: "ltr", maxlength: 60, "aria-describedby": `${id}-problem`, "aria-label": "Folder name, type here to rename", autocomplete: "off", spellcheck: "false" });
     input.value = rule.folder;
     const hint = h("p", { class: "hint", id: `${id}-hint` }, "Suggested");
     hint.hidden = !(named.has(rule) && rule.folder);
@@ -96,9 +96,12 @@ function edit({ rules, kinds, defaults }) {
       const place = own().indexOf(rule);
       const called = rule.folder ? clean(rule.folder) : "new folder";
       tools.append(
-        button("text", opened === rule ? "Close" : "Edit", () => { opened = opened === rule ? null : rule; draw(rule, ".edit"); }, { "aria-expanded": String(opened === rule), "aria-label": `${opened === rule ? "Close" : "Edit"} ${called}` }),
-        button("text", "Up", () => shift(rule, -1), { "aria-label": `Move ${called} up`, ...(place === 0 ? { disabled: "" } : {}) }),
-        button("text", "Down", () => shift(rule, 1), { "aria-label": `Move ${called} down`, ...(place === own().length - 1 ? { disabled: "" } : {}) }),
+        button("text", opened === rule ? "Done choosing" : "Choose files", () => { opened = opened === rule ? null : rule; draw(rule, ".edit"); }, {
+          "aria-expanded": String(opened === rule),
+          "aria-label": opened === rule ? `Done choosing files for ${called}` : `Choose which files go to ${called}. To rename it, type in its name box.`,
+        }),
+        button("text", "Move up", () => shift(rule, -1), { "aria-label": `Move ${called} up`, ...(place === 0 ? { disabled: "" } : {}) }),
+        button("text", "Move down", () => shift(rule, 1), { "aria-label": `Move ${called} down`, ...(place === own().length - 1 ? { disabled: "" } : {}) }),
         button("text", "Delete", () => remove(rule), { "aria-label": `Delete ${called}` }),
       );
       ["edit", "up", "down", "delete"].forEach((name, index) => tools.children[index].classList.add(name));
@@ -242,6 +245,7 @@ function edit({ rules, kinds, defaults }) {
     const rest = draft.filter((other) => builtIn.has(other.id));
     const rows = new Map(draft.map((item) => [item, row(item)]));
     holder.replaceChildren(...[
+      h("p", { class: "lead" }, "If a file fits more than one folder, it goes to the highest one."),
       mine.length ? h("h3", {}, "Your folders") : null,
       mine.length ? h("ul", {}, ...mine.map((item) => rows.get(item))) : null,
       h("h3", {}, "Built-in folders"),
@@ -257,16 +261,24 @@ function edit({ rules, kinds, defaults }) {
   draw();
   stage({
     say: "Change folders",
-    why: "Rename a folder, switch it off, or add your own. Files already sorted stay where they are.",
+    why: "Type in a name box to rename a folder. Switch folders off, or add your own. Files already sorted stay where they are.",
     art: holder,
     buttons: [save, button("next", "Add a folder", add), button("next", "Reset", reset, { "aria-label": "Reset to the built-in folders" }), button("next", "Cancel", () => go.tab("tidy")), problem],
     focus: true,
   });
 }
 
-function nameProblem(name) {
-  if (!name) return "A folder needs a name.";
-  if (/[<>:"/\\|?*]/.test(name)) return 'A folder name can\'t contain < > : " / \\ | ? *';
-  if (/^[.~]/.test(name) || name.endsWith(".")) return "A folder name can't start with a dot or ~, or end with a dot.";
+const LONGEST = 60;
+const RESERVED = /^(?:con|prn|aux|nul|clock\$|conin\$|conout\$|(?:com|lpt)[0-9\u00b9\u00b2\u00b3])\s*(?:\..*)?$/is;
+
+/** The same checks as the server makes, so a problem shows next to the name before anything is saved. */
+export function nameProblem(value) {
+  const name = value.normalize("NFC");
+  if (!name.trim()) return "A folder needs a name.";
+  if ([...name].length > LONGEST) return `A folder name can have at most ${LONGEST} characters.`;
+  if (/[<>:"/\\|?*]/.test(name) || /[\p{C}\p{Z}]/u.test(name.replaceAll(" ", ""))) return 'A folder name can\'t contain < > : " / \\ | ? * or invisible characters.';
+  if (/^[.~ ]/.test(name)) return "A folder name can't start with a dot, a space or ~.";
+  if (/[. ]$/.test(name)) return "A folder name can't end with a dot or a space.";
+  if (RESERVED.test(name)) return `${clean(name)} is a name Windows keeps for itself.`;
   return "";
 }
