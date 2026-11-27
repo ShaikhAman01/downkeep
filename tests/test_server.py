@@ -613,12 +613,35 @@ class PageTest(unittest.TestCase):
         self.assertIn("Off until you turn it on.", seen["first"])
         self.assertEqual(seen["before"], [])
         for text in ["Turn on automatic tidying?", "Every hour, new files older than 1 day move to their folder, even when Downkeep is closed.",
-                     "These folders take new files:", "new files, after 1 day, to Downloads", "Nothing would move right now.",
+                     "Choose which folders take new files, and when:", "to Downloads", "Nothing would move right now.",
                      "The 4 files here now stay where they are."]:
             self.assertIn(text, seen["asking"])
         self.assertNotIn("Music", seen["asking"])
         self.assertEqual(seen["buttons"], ["Turn on", "Cancel"])
         self.assertEqual(seen["after"], [["/api/auto/set", {"on": True, "confirmed": True}]])
+
+    def test_folders_can_change_before_turning_on(self):
+        seen = self.run_page(self.AUTO % "false" + """
+          core.go.changed = () => {};
+          answers["/api/rules/save"] = { rules: [{ id: "documents", folder: "Documents", on: true, auto: false, days: 1 },
+                                                 { id: "images", folder: "Images", on: true, auto: false, days: 1 },
+                                                 { id: "music", folder: "Music", on: false, auto: true, days: 1 }] };
+          const asking = find(panel, (node) => /\\bfolders\\b/.test(node.attrs?.class ?? ""))[0];
+          const here = find(asking, (node) => node.tagName === "select" || node.attrs?.role === "switch");
+          const turnOn = find(panel, (node) => node.tagName === "button" && node.textContent === "Turn on")[0];
+          const enabled = here.map((node) => node.disabled === true);
+          await press(here.find((node) => node.attrs.role === "switch" && node.attrs["aria-label"].includes("Images")));
+          const now = find(panel, (node) => node.attrs?.class === "now")[0];
+          const cancel = find(panel, (node) => node.tagName === "button" && node.textContent === "Cancel")[0];
+          await press(cancel);
+          const back = find(panel, (node) => node.attrs?.role === "switch" && node.attrs["aria-label"]?.includes("Images"))[0];
+          return { enabled, saved: asked.filter((call) => call[0] === "/api/rules/save").length,
+                   turnOn: Boolean(turnOn.disabled), now: Boolean(now.hidden), back: back.attrs["aria-checked"] };
+        """)
+        self.assertEqual(seen["enabled"], [False, False, False, False])
+        self.assertEqual(seen["saved"], 1)
+        self.assertEqual((seen["turnOn"], seen["now"]), (True, True))
+        self.assertEqual(seen["back"], "false")
 
     def test_folders_wait_and_cannot_change_while_automatic_is_off(self):
         body = """
