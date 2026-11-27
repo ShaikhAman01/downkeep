@@ -419,7 +419,7 @@ class Smoke:
     def clean_start_of_others(self) -> None:
         """Without a link file it starts a browser; that browser must not get the bundled libraries."""
         seen = self.home.root / "browser"
-        stub = self.home.stubs / "google-chrome-stable"
+        stub = self.home.stubs / "chromium"
         usual = stub.read_text(encoding="utf-8")
         stub.write_text(
             '#!/bin/sh\n'
@@ -442,7 +442,7 @@ class Smoke:
             check(seen.exists(), "it never started the browser")
             text = seen.read_text(encoding="utf-8")
             check("LD=/made-up/libraries\n" in text, f"the browser got changed library settings: {text.splitlines()[0]}")
-            check(re.search(r"URL=--app=http://127\.0\.0\.1:\d+/#[\w-]{43}\n", text), "the browser got another link")
+            check(re.search(r"URL=--app=http://127\.0\.0\.1:\d+/\?window=app#[\w-]{43}\n", text), "the browser got another link")
         finally:
             process.kill()
             process.wait(30)
