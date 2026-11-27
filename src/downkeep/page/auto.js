@@ -52,7 +52,7 @@ function draw(status, rules, focus, arriving = false) {
   const problem = h("p", { class: "problem", role: "alert" });
   const elsewhere = status.on && status.folder && status.folder !== state.report.folder;
 
-  const back = () => draw(status, shown, true);
+  const back = (rules = shown) => draw(status, rules, true);
 
   async function master(on, control) {
     control.setAttribute("aria-checked", String(on));
@@ -82,18 +82,7 @@ function draw(status, rules, focus, arriving = false) {
   }
 
   async function change(rule, changes, control, undoChange) {
-    control.disabled = true;
-    problem.textContent = "";
-    const next = shown.map((other) => (other.id === rule.id ? { ...other, ...changes } : other));
-    try {
-      ({ rules: shown } = await ask("/api/rules/save", { rules: next }));
-      go.changed();
-    } catch (error) {
-      undoChange();
-      if (!ended(error)) problem.textContent = sentence(clean(error.message));
-    }
-    control.disabled = false;
-    control.focus();
+    shown = await save(shown, rule, changes, control, undoChange, problem);
     idle();
   }
 
@@ -103,19 +92,9 @@ function draw(status, rules, focus, arriving = false) {
   };
 
   function row(rule) {
-    const id = `days-${rule.id}`;
-    const choice = h("select", { id, "aria-label": `When to move new files to ${clean(rule.folder)}` },
-      ...[...new Set([...DAYS, rule.days])].sort((a, b) => a - b).map((days) => h("option", { value: days }, after(days))));
-    choice.value = String(rule.days);
-    let saved = rule.days;
-    choice.addEventListener("change", () => change(rule, { days: Number(choice.value) }, choice, () => { choice.value = String(saved); })
-      .then(() => { saved = Number(choice.value); }));
-    const control = switchButton(rule.auto, `Move new files to ${rule.folder}`, (on) => {
-      control.setAttribute("aria-checked", String(on));
-      change(rule, { auto: on }, control, () => control.setAttribute("aria-checked", String(!on)));
-    });
-    controls.push(choice, control);
-    return h("li", {}, h("div", {}, h("b", {}, bdi(rule.folder)), h("p", { class: "soft" }, "to ", bdi(place(baseName(state.report.folder), rule.folder)), ", ", choice)), control);
+    const [item, ...parts] = folderRow(rule, change);
+    controls.push(...parts);
+    return item;
   }
 
   idle();
@@ -170,6 +149,40 @@ function draw(status, rules, focus, arriving = false) {
   }
 }
 
+/** Saves one folder's change and gives back every folder as stored, or as it was when that fails. */
+async function save(rules, rule, changes, control, undoChange, problem) {
+  control.disabled = true;
+  problem.textContent = "";
+  const next = rules.map((other) => (other.id === rule.id ? { ...other, ...changes } : other));
+  try {
+    ({ rules } = await ask("/api/rules/save", { rules: next }));
+    go.changed();
+  } catch (error) {
+    undoChange();
+    if (!ended(error)) problem.textContent = sentence(clean(error.message));
+  }
+  control.disabled = false;
+  control.focus();
+  return rules;
+}
+
+/** One folder: when its new files move, and whether they move at all. Gives back the row and its two controls. */
+function folderRow(rule, change) {
+  const id = `days-${rule.id}`;
+  const choice = h("select", { id, "aria-label": `When to move new files to ${clean(rule.folder)}` },
+    ...[...new Set([...DAYS, rule.days])].sort((a, b) => a - b).map((days) => h("option", { value: days }, after(days))));
+  choice.value = String(rule.days);
+  let saved = rule.days;
+  choice.addEventListener("change", () => change(rule, { days: Number(choice.value) }, choice, () => { choice.value = String(saved); })
+    .then(() => { saved = Number(choice.value); }));
+  const control = switchButton(rule.auto, `Move new files to ${rule.folder}`, (on) => {
+    control.setAttribute("aria-checked", String(on));
+    change(rule, { auto: on }, control, () => control.setAttribute("aria-checked", String(!on)));
+  });
+  const item = h("li", {}, h("div", {}, h("b", {}, bdi(rule.folder)), h("p", { class: "soft" }, "to ", bdi(place(baseName(state.report.folder), rule.folder)), ", ", choice)), control);
+  return [item, choice, control];
+}
+
 export function intro(status, elsewhere) {
   if (!status.on) return "Off until you turn it on. It only moves files that arrive after that, using the same folders you approved.";
   if (elsewhere) return `On for ${baseName(status.folder)}. It only moves files that arrived there after it was turned on.`;
@@ -192,29 +205,46 @@ function state_(status, rules, elsewhere) {
   return `On. ${every(used)}${waiting}${problem}`;
 }
 
-/** Nothing here now ever moves by itself: turning it on counts every file already in the folder as staying. */
+/**
+ * Nothing here now ever moves by itself: turning it on counts every file already in the folder as staying.
+ * The folders can still be changed here, since they can't be while it is off.
+ */
 export function preview(rules, back = () => go.tab("auto")) {
   visit();
-  const used = rules.filter((rule) => rule.on && rule.auto);
+  let shown = rules;
   const problem = h("p", { class: "problem", role: "alert" });
   const files = state.report?.files ?? 0;
+  const now = h("p", { class: "now" }, h("b", {}, "Nothing would move right now. "),
+    files ? `The ${plural(files, "file")} here now stay where they are. Only files that arrive after you turn it on can move.` : "Only files that arrive after you turn it on can move.");
+  const turnOn = button("main-act", "Turn on", (event) => { event.currentTarget.disabled = true; set(true, problem, event.currentTarget); });
+
+  const why = (used) => (used.length ? every(used, "as set for each folder") : "No folder is switched on for it yet. Switch at least one on first.");
+  function sum() {
+    const used = shown.filter((rule) => rule.on && rule.auto);
+    const line = panel.querySelector(".why");
+    if (line) line.textContent = why(used);
+    now.hidden = !used.length;
+    turnOn.disabled = !used.length;
+  }
+
+  async function change(rule, changes, control, undoChange) {
+    shown = await save(shown, rule, changes, control, undoChange, problem);
+    sum();
+  }
+
   stage({
     say: "Turn on automatic tidying?",
-    why: used.length ? every(used, "as set for each folder") : "No folder is switched on for it yet. Switch at least one on first.",
+    why: why(shown.filter((rule) => rule.on && rule.auto)),
     art: h("div", { class: "hold autos" },
-      used.length ? h("p", { class: "now" }, h("b", {}, "Nothing would move right now. "),
-        files ? `The ${plural(files, "file")} here now stay where they are. Only files that arrive after you turn it on can move.` : "Only files that arrive after you turn it on can move.") : null,
-      used.length ? h("p", { class: "soft" }, `${used.length === 1 ? "This folder takes" : "These folders take"} new files:`) : null,
-      h("ul", {}, ...used.map((rule) =>
-        h("li", {}, h("div", {}, h("b", {}, bdi(rule.folder)), h("p", { class: "soft" }, "new files, ", after(rule.days), ", to ", bdi(place(baseName(state.report.folder), rule.folder))))))),
+      now,
+      h("p", { class: "soft" }, "Choose which folders take new files, and when:"),
+      h("ul", { class: "folders" }, ...shown.filter((rule) => rule.on).map((rule) => folderRow(rule, change)[0])),
       problem),
-    buttons: [
-      used.length ? button("main-act", "Turn on", (event) => { event.currentTarget.disabled = true; set(true, problem, event.currentTarget); }) : null,
-      button("next", "Cancel", back),
-    ].filter(Boolean),
+    buttons: [turnOn, button("next", "Cancel", () => back(shown))],
     note: NEVER,
     focus: true,
   });
+  sum();
   enter();
 }
 
