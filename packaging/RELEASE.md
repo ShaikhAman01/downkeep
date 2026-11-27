@@ -1,11 +1,15 @@
-# Downkeep 0.1.0
+# Downkeep 0.1.1
 
 Careful cleanup for your Downloads folder. Free, no account, nothing leaves your computer.
 
+**New in 0.1.1**
+
+- When you turn Automatic on, you can now choose which folders take new files, and when, before confirming. Before, there was no way to change them until it was already on.
+
 **Download**
 
-- Windows 10 or 11 (64-bit): `Downkeep-0.1.0-windows-x64.zip`
-- Linux (64-bit, glibc 2.35 or newer, for example Ubuntu 22.04 or later): `downkeep-0.1.0-linux-x64.tar.gz`
+- Windows 10 or 11 (64-bit): `Downkeep-0.1.1-windows-x64.zip`
+- Linux (64-bit, glibc 2.35 or newer, for example Ubuntu 22.04 or later): `downkeep-0.1.1-linux-x64.tar.gz`
 
 It uses Chrome, Edge, Brave, Firefox or another browser you already have for its window.
 
@@ -37,7 +41,7 @@ It never deletes a file for good, never replaces one file with another, and neve
 - On Windows, undo cannot take files out of the Recycle Bin. You can do that yourself from the Recycle Bin.
 - To remove it on Windows: turn Automatic off in Downkeep first if you use it, then close Downkeep and delete its folder.
 - macOS: no download yet. From source it is read-only.
-- This is a first release. If something surprises you, please open an issue.
+- This is an early release. If something surprises you, please open an issue.
 
 **SHA-256**
 
